@@ -11,10 +11,12 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -29,6 +31,9 @@ namespace hygon_conv_detail {
 
 struct ConvInfo {
   size_t request_count, T, C, pool_size, total_tokens;
+  int compute_units = 1;
+  int max_threads_per_block = 1024;
+  const void *history = nullptr;  // Per-request snapshot, owned by workspace.
   bool has_bias, has_cu_seqlens, indexed_state_pool;
   int cu_seqlens_kind, initial_indices_kind,
       final_indices_kind;  // 0=none 1=i32 2=i64
@@ -38,11 +43,12 @@ struct ConvInfo {
   std::vector<ptrdiff_t> final_conv_state_strides;
 };
 
-// Metadata shared by contiguous K4 launch selection and decode capture.
+// The contiguous specialization is a layout property, not a benchmark shape
+// whitelist. Batch and sequence length remain runtime dimensions.
 inline bool has_indexed_k4_layout(const ConvInfo &info) {
-  return info.indexed_state_pool && info.T > 0 && info.T <= 128 &&
-         info.C == 4096 && info.initial_indices_kind != 2 &&
-         info.final_indices_kind == 1 && info.has_bias &&
+  return info.indexed_state_pool && info.T > 0 && info.C == 4096 &&
+         info.initial_indices_kind != 2 && info.final_indices_kind == 1 &&
+         info.has_bias &&
          info.qkv_strides[0] == static_cast<ptrdiff_t>(info.T * 4096) &&
          info.qkv_strides[1] == 4096 && info.qkv_strides[2] == 1 &&
          info.out_strides[0] == static_cast<ptrdiff_t>(info.T * 4096) &&
@@ -51,6 +57,91 @@ inline bool has_indexed_k4_layout(const ConvInfo &info) {
          info.conv_state_strides[1] == 3 && info.conv_state_strides[2] == 1 &&
          info.weight_strides[0] == 4 && info.weight_strides[2] == 1 &&
          !info.bias_strides.empty() && info.bias_strides[0] == 1;
+}
+
+// Public metadata validation must remain active in release builds. The base
+// key's legacy assert checks do not protect malformed ranks under NDEBUG.
+inline Tensor checked_input(
+    const Tensor qkv, const Tensor weight, const Tensor state,
+    const std::optional<Tensor> &bias, const std::optional<Tensor> &cu,
+    const std::optional<Tensor> &initial, const std::optional<Tensor> &final,
+    const Tensor out, const std::optional<Tensor> &final_state) {
+  if (qkv.ndim() != 3 || weight.ndim() != 3 || state.ndim() != 3 ||
+      out.ndim() != 3)
+    throw std::invalid_argument(
+        "Hygon causal conv requires rank-three data tensors");
+  const auto dtype = qkv.dtype();
+  if (dtype != DataType::kFloat32 && dtype != DataType::kFloat16 &&
+      dtype != DataType::kBFloat16)
+    throw std::invalid_argument("Hygon causal conv dtype unsupported");
+  const size_t channels = qkv.size(2);
+  if (out.shape() != qkv.shape() ||
+      weight.shape() != Tensor::Shape{channels, 1, 4} ||
+      state.size(1) != channels || state.size(2) != 3 ||
+      final.has_value() == final_state.has_value())
+    throw std::invalid_argument(
+        "Hygon causal conv weight/state/output metadata mismatch");
+  size_t requests = qkv.size(0);
+  if (cu) {
+    if (qkv.size(0) != 1 || cu->ndim() != 1 || cu->numel() < 2)
+      throw std::invalid_argument(
+          "Hygon causal conv packed sequence metadata mismatch");
+    requests = cu->numel() - 1;
+  }
+  if ((!initial && state.size(0) < requests) ||
+      (final_state &&
+       final_state->shape() != Tensor::Shape{requests, channels, 3}) ||
+      (bias && bias->shape() != Tensor::Shape{channels}))
+    throw std::invalid_argument(
+        "Hygon causal conv state pool/bias metadata mismatch");
+  const std::array<std::optional<Tensor>, 9> views{
+      qkv, weight, state, bias, cu, initial, final, out, final_state};
+  for (size_t i = 0; i < views.size(); ++i) {
+    if (!views[i]) continue;
+    const auto &t = *views[i];
+    if (t.device() != qkv.device() || t.ndim() != t.strides().size())
+      throw std::invalid_argument(
+          "Hygon causal conv device or stride rank mismatch");
+    const bool index = i >= 4 && i <= 6;
+    if (index ? (t.ndim() != 1 || !t.IsContiguous() ||
+                 (t.dtype() != DataType::kInt32 &&
+                  t.dtype() != DataType::kInt64) ||
+                 (i != 4 && t.numel() != requests))
+              : t.dtype() != dtype)
+      throw std::invalid_argument(
+          "Hygon causal conv tensor dtype or index metadata mismatch");
+    size_t span = 1;
+    const size_t limit =
+        static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max());
+    for (size_t axis = 0; axis < t.ndim(); ++axis) {
+      if (t.stride(axis) < 0)
+        throw std::invalid_argument(
+            "Hygon causal conv negative stride unsupported");
+      const auto stride = static_cast<size_t>(t.stride(axis));
+      if (t.size(axis) && stride && t.size(axis) - 1 > (limit - span) / stride)
+        throw std::overflow_error("Hygon causal conv tensor span overflow");
+      if (t.size(axis)) span += (t.size(axis) - 1) * stride;
+    }
+    const size_t width =
+        t.dtype() == DataType::kInt64
+            ? 8
+            : (t.dtype() == DataType::kFloat32 || t.dtype() == DataType::kInt32
+                   ? 4
+                   : 2);
+    if (span > limit / width)
+      throw std::overflow_error("Hygon causal conv tensor byte span overflow");
+    if (t.numel() && ((i == 2 && final) || i == 7 || i == 8)) {
+      size_t extent = 1;
+      for (int axis = static_cast<int>(t.ndim()) - 1; axis >= 0; --axis) {
+        if (t.size(axis) > 1 && static_cast<size_t>(t.stride(axis)) < extent)
+          throw std::invalid_argument(
+              "Hygon causal conv overlapping writable layout");
+        if (t.size(axis))
+          extent += (t.size(axis) - 1) * static_cast<size_t>(t.stride(axis));
+      }
+    }
+  }
+  return qkv;
 }
 
 namespace {
@@ -163,109 +254,11 @@ __device__ __forceinline__ int64_t load_optional_index(const void *indices,
              : static_cast<int64_t>(static_cast<const int32_t *>(indices)[idx]);
 }
 
-template <typename T, bool kHasInitialState, int kChannelsPerThread>
-__global__
-__launch_bounds__(64) void causal_conv1d_k4_lowp_contiguous_t16_kernel(
-    T *out, T *conv_state, const T *qkv, const T *weight, const T *bias,
-    const int32_t *initial_state_indices, const int32_t *final_state_indices,
-    size_t pool_size) {
-  constexpr int kChannels = 4096;
-  constexpr int kTokens = 16;
-  constexpr int kTile = 4;
-  constexpr int kStateSize = 3;
-  const int request = static_cast<int>(blockIdx.x);
-  const int chunk = static_cast<int>(blockIdx.y);
-  const int channel_start = static_cast<int>(
-      blockIdx.z * blockDim.x * kChannelsPerThread + threadIdx.x);
-  const int read_slot =
-      kHasInitialState ? initial_state_indices[request] : request;
-  const int write_slot = final_state_indices[request];
-  if (read_slot < 0 || write_slot < 0 ||
-      read_slot >= static_cast<int64_t>(pool_size) ||
-      write_slot >= static_cast<int64_t>(pool_size)) {
-    return;
-  }
-
-#pragma unroll
-  for (int channel_offset = 0; channel_offset < kChannelsPerThread;
-       ++channel_offset) {
-    const int channel = channel_start + channel_offset * blockDim.x;
-    if (channel >= kChannels) {
-      continue;
-    }
-
-    const int weight_offset = channel * 4;
-    const float weight0 = load_as_float(weight, weight_offset);
-    const float weight1 = load_as_float(weight, weight_offset + 1);
-    const float weight2 = load_as_float(weight, weight_offset + 2);
-    const float weight3 = load_as_float(weight, weight_offset + 3);
-    const float bias_value = load_as_float(bias, channel);
-    const ptrdiff_t batch_base =
-        static_cast<ptrdiff_t>(request) * kTokens * kChannels + channel;
-
-    if (chunk == 0) {
-      const ptrdiff_t read_base =
-          (static_cast<ptrdiff_t>(read_slot) * kChannels + channel) *
-          kStateSize;
-      float history0 = load_as_float(conv_state, read_base);
-      float history1 = load_as_float(conv_state, read_base + 1);
-      float history2 = load_as_float(conv_state, read_base + 2);
-#pragma unroll
-      for (int token = 0; token < 3; ++token) {
-        const ptrdiff_t offset = batch_base + token * kChannels;
-        const float current = load_as_float(qkv, offset);
-        const float result =
-            conv4_with_bias<T>(weight0, history0, weight1, history1, weight2,
-                               history2, weight3, current, bias_value);
-        out[offset] = cast_from_float<T>(result);
-        history0 = history1;
-        history1 = history2;
-        history2 = current;
-      }
-
-      const ptrdiff_t final_offset = batch_base + 15 * kChannels;
-      const float previous0 = load_as_float(qkv, batch_base + 12 * kChannels);
-      const float previous1 = load_as_float(qkv, batch_base + 13 * kChannels);
-      const float previous2 = load_as_float(qkv, batch_base + 14 * kChannels);
-      const float current = load_as_float(qkv, final_offset);
-      const float result =
-          conv4_with_bias<T>(weight0, previous0, weight1, previous1, weight2,
-                             previous2, weight3, current, bias_value);
-      out[final_offset] = cast_from_float<T>(result);
-
-      const ptrdiff_t write_base =
-          (static_cast<ptrdiff_t>(write_slot) * kChannels + channel) *
-          kStateSize;
-      conv_state[write_base] = cast_from_float<T>(previous1);
-      conv_state[write_base + 1] = cast_from_float<T>(previous2);
-      conv_state[write_base + 2] = cast_from_float<T>(current);
-    } else {
-      const int first_token = 3 + (chunk - 1) * kTile;
-      const ptrdiff_t first_offset = batch_base + first_token * kChannels;
-      float history0 = load_as_float(qkv, first_offset - 3 * kChannels);
-      float history1 = load_as_float(qkv, first_offset - 2 * kChannels);
-      float history2 = load_as_float(qkv, first_offset - kChannels);
-#pragma unroll
-      for (int tile_token = 0; tile_token < kTile; ++tile_token) {
-        const ptrdiff_t offset = first_offset + tile_token * kChannels;
-        const float current = load_as_float(qkv, offset);
-        const float result =
-            conv4_with_bias<T>(weight0, history0, weight1, history1, weight2,
-                               history2, weight3, current, bias_value);
-        out[offset] = cast_from_float<T>(result);
-        history0 = history1;
-        history1 = history2;
-        history2 = current;
-      }
-    }
-  }
-}
-
 template <typename T, int kThreads>
 __global__ __launch_bounds__(kThreads) void causal_conv1d_k4_decode_kernel(
     T *out, T *conv_state, const T *qkv, const T *weight, const T *bias,
     const int32_t *initial_state_indices, const int32_t *final_state_indices,
-    size_t pool_size) {
+    size_t pool_size, const T *history_snapshot) {
   constexpr int kChannels = 4096;
   const int request = blockIdx.y;
   const int channel = blockIdx.x * kThreads + threadIdx.x;
@@ -279,12 +272,16 @@ __global__ __launch_bounds__(kThreads) void causal_conv1d_k4_decode_kernel(
     return;
   }
   const ptrdiff_t read_base =
-      (static_cast<ptrdiff_t>(read_slot) * kChannels + channel) * 3;
+      (static_cast<ptrdiff_t>(history_snapshot ? request : read_slot) *
+           kChannels +
+       channel) *
+      3;
   const ptrdiff_t write_base =
       (static_cast<ptrdiff_t>(write_slot) * kChannels + channel) * 3;
-  const T history0 = conv_state[read_base];
-  const T history1 = conv_state[read_base + 1];
-  const T history2 = conv_state[read_base + 2];
+  const T *history_source = history_snapshot ? history_snapshot : conv_state;
+  const T history0 = history_source[read_base];
+  const T history1 = history_source[read_base + 1];
+  const T history2 = history_source[read_base + 2];
   const ptrdiff_t input_index =
       static_cast<ptrdiff_t>(request) * kChannels + channel;
   const T current = qkv[input_index];
@@ -332,37 +329,34 @@ struct alignas(4) CausalHistoryPair {
   unsigned int values[3];
 };
 
-template <typename T, int kThreads, bool kSingleRequestPool = false>
+template <typename T, int kThreads>
 __global__ __launch_bounds__(kThreads) void causal_conv1d_k4_decode_pair_kernel(
     T *out, T *conv_state, const T *qkv, const T *weight, const T *bias,
     const int32_t *initial_state_indices, const int32_t *final_state_indices,
-    size_t pool_size) {
+    size_t pool_size, const T *history_snapshot) {
   constexpr int kChannels = 4096;
-  const int request = kSingleRequestPool ? 0 : blockIdx.y;
+  const int request = blockIdx.y;
   const int channel = (blockIdx.x * kThreads + threadIdx.x) * 2;
   const int read_slot = initial_state_indices == nullptr
                             ? request
                             : initial_state_indices[request];
   const int write_slot = final_state_indices[request];
-  if constexpr (kSingleRequestPool) {
-    if (read_slot != 0 || write_slot != 0) return;
-  } else if (read_slot < 0 || write_slot < 0 ||
-             static_cast<size_t>(read_slot) >= pool_size ||
-             static_cast<size_t>(write_slot) >= pool_size) {
+  if (read_slot < 0 || write_slot < 0 ||
+      static_cast<size_t>(read_slot) >= pool_size ||
+      static_cast<size_t>(write_slot) >= pool_size)
     return;
-  }
   const ptrdiff_t read_base =
-      (static_cast<ptrdiff_t>(kSingleRequestPool ? 0 : read_slot) * kChannels +
+      (static_cast<ptrdiff_t>(history_snapshot ? request : read_slot) *
+           kChannels +
        channel) *
       3;
   const ptrdiff_t write_base =
-      (static_cast<ptrdiff_t>(kSingleRequestPool ? 0 : write_slot) * kChannels +
-       channel) *
-      3;
+      (static_cast<ptrdiff_t>(write_slot) * kChannels + channel) * 3;
   const ptrdiff_t input_base =
       static_cast<ptrdiff_t>(request) * kChannels + channel;
   const CausalHistoryPair history =
-      *reinterpret_cast<const CausalHistoryPair *>(conv_state + read_base);
+      *reinterpret_cast<const CausalHistoryPair *>(
+          (history_snapshot ? history_snapshot : conv_state) + read_base);
   const uint4 weights = *reinterpret_cast<const uint4 *>(weight + channel * 4);
   const unsigned int current =
       *reinterpret_cast<const unsigned int *>(qkv + input_base);
@@ -401,18 +395,19 @@ __global__ __launch_bounds__(kThreads) void causal_conv1d_k4_decode_pair_kernel(
   *reinterpret_cast<CausalHistoryPair *>(conv_state + write_base) = updated;
 }
 
-template <typename T, int kTimeTile>
+template <typename T, int kTimeTile, int kChannelsPerThread,
+          bool kHasInitialState>
 __global__ void causal_conv1d_k4_contiguous_tiled_kernel(
     T *out, T *conv_state, const T *qkv, const T *weight, const T *bias,
     const int32_t *initial_state_indices, const int32_t *final_state_indices,
-    size_t token_count, size_t pool_size) {
+    size_t token_count, size_t pool_size, const T *history_snapshot) {
   constexpr int kChannels = 4096;
   const int request = blockIdx.x;
   const int chunk = blockIdx.y;
-  const int channel = blockIdx.z * blockDim.x + threadIdx.x;
-  const int read_slot = initial_state_indices == nullptr
-                            ? request
-                            : initial_state_indices[request];
+  const int first_channel =
+      blockIdx.z * blockDim.x * kChannelsPerThread + threadIdx.x;
+  const int read_slot =
+      kHasInitialState ? initial_state_indices[request] : request;
   const int write_slot = final_state_indices[request];
   if (read_slot < 0 || write_slot < 0 ||
       read_slot >= static_cast<int64_t>(pool_size) ||
@@ -420,67 +415,35 @@ __global__ void causal_conv1d_k4_contiguous_tiled_kernel(
     return;
   }
 
-  const ptrdiff_t weight_offset = static_cast<ptrdiff_t>(channel) * 4;
-  const float weight0 = load_as_float(weight, weight_offset);
-  const float weight1 = load_as_float(weight, weight_offset + 1);
-  const float weight2 = load_as_float(weight, weight_offset + 2);
-  const float weight3 = load_as_float(weight, weight_offset + 3);
-  const float bias_value = load_as_float(bias, channel);
-  const ptrdiff_t batch_base =
-      static_cast<ptrdiff_t>(request) * token_count * kChannels + channel;
-
-  if (chunk == 0) {
-    const ptrdiff_t read_base =
-        (static_cast<ptrdiff_t>(read_slot) * kChannels + channel) * 3;
-    float history0 = load_as_float(conv_state, read_base);
-    float history1 = load_as_float(conv_state, read_base + 1);
-    float history2 = load_as_float(conv_state, read_base + 2);
-    for (int token = 0; token < 3; ++token) {
-      if (token >= token_count) {
-        break;
-      }
-      const ptrdiff_t offset = batch_base + token * kChannels;
-      const float current = load_as_float(qkv, offset);
-      const float result =
-          conv4_with_bias<T>(weight0, history0, weight1, history1, weight2,
-                             history2, weight3, current, bias_value);
-      out[offset] = cast_from_float<T>(result);
-      history0 = history1;
-      history1 = history2;
-      history2 = current;
-    }
-
-    if (token_count >= 4) {
-      const ptrdiff_t final_offset = batch_base + (token_count - 1) * kChannels;
-      const float previous0 = load_as_float(qkv, final_offset - 3 * kChannels);
-      const float previous1 = load_as_float(qkv, final_offset - 2 * kChannels);
-      const float previous2 = load_as_float(qkv, final_offset - kChannels);
-      const float current = load_as_float(qkv, final_offset);
-      const float result =
-          conv4_with_bias<T>(weight0, previous0, weight1, previous1, weight2,
-                             previous2, weight3, current, bias_value);
-      out[final_offset] = cast_from_float<T>(result);
-      history0 = previous1;
-      history1 = previous2;
-      history2 = current;
-    }
-
-    const ptrdiff_t write_base =
-        (static_cast<ptrdiff_t>(write_slot) * kChannels + channel) * 3;
-    conv_state[write_base] = cast_from_float<T>(history0);
-    conv_state[write_base + 1] = cast_from_float<T>(history1);
-    conv_state[write_base + 2] = cast_from_float<T>(history2);
-  } else {
-    const int64_t first_token = 3 + static_cast<int64_t>(chunk - 1) * kTimeTile;
-    const ptrdiff_t first_offset = batch_base + first_token * kChannels;
-    float history0 = load_as_float(qkv, first_offset - 3 * kChannels);
-    float history1 = load_as_float(qkv, first_offset - 2 * kChannels);
-    float history2 = load_as_float(qkv, first_offset - kChannels);
 #pragma unroll
-    for (int tile_token = 0; tile_token < kTimeTile; ++tile_token) {
-      const int64_t token = first_token + tile_token;
-      if (token < static_cast<int64_t>(token_count) - 1) {
-        const ptrdiff_t offset = first_offset + tile_token * kChannels;
+  for (int offset = 0; offset < kChannelsPerThread; ++offset) {
+    const int channel = first_channel + offset * blockDim.x;
+    if (channel >= kChannels) continue;
+    const ptrdiff_t weight_offset = static_cast<ptrdiff_t>(channel) * 4;
+    const float weight0 = load_as_float(weight, weight_offset);
+    const float weight1 = load_as_float(weight, weight_offset + 1);
+    const float weight2 = load_as_float(weight, weight_offset + 2);
+    const float weight3 = load_as_float(weight, weight_offset + 3);
+    const float bias_value = load_as_float(bias, channel);
+    const ptrdiff_t batch_base =
+        static_cast<ptrdiff_t>(request) * token_count * kChannels + channel;
+
+    if (chunk == 0) {
+      const ptrdiff_t read_base =
+          (static_cast<ptrdiff_t>(history_snapshot ? request : read_slot) *
+               kChannels +
+           channel) *
+          3;
+      const T *history_source =
+          history_snapshot ? history_snapshot : conv_state;
+      float history0 = load_as_float(history_source, read_base);
+      float history1 = load_as_float(history_source, read_base + 1);
+      float history2 = load_as_float(history_source, read_base + 2);
+      for (int token = 0; token < 3; ++token) {
+        if (token >= token_count) {
+          break;
+        }
+        const ptrdiff_t offset = batch_base + token * kChannels;
         const float current = load_as_float(qkv, offset);
         const float result =
             conv4_with_bias<T>(weight0, history0, weight1, history1, weight2,
@@ -489,6 +452,52 @@ __global__ void causal_conv1d_k4_contiguous_tiled_kernel(
         history0 = history1;
         history1 = history2;
         history2 = current;
+      }
+
+      if (token_count >= 4) {
+        const ptrdiff_t final_offset =
+            batch_base + (token_count - 1) * kChannels;
+        const float previous0 =
+            load_as_float(qkv, final_offset - 3 * kChannels);
+        const float previous1 =
+            load_as_float(qkv, final_offset - 2 * kChannels);
+        const float previous2 = load_as_float(qkv, final_offset - kChannels);
+        const float current = load_as_float(qkv, final_offset);
+        const float result =
+            conv4_with_bias<T>(weight0, previous0, weight1, previous1, weight2,
+                               previous2, weight3, current, bias_value);
+        out[final_offset] = cast_from_float<T>(result);
+        history0 = previous1;
+        history1 = previous2;
+        history2 = current;
+      }
+
+      const ptrdiff_t write_base =
+          (static_cast<ptrdiff_t>(write_slot) * kChannels + channel) * 3;
+      conv_state[write_base] = cast_from_float<T>(history0);
+      conv_state[write_base + 1] = cast_from_float<T>(history1);
+      conv_state[write_base + 2] = cast_from_float<T>(history2);
+    } else {
+      const int64_t first_token =
+          3 + static_cast<int64_t>(chunk - 1) * kTimeTile;
+      const ptrdiff_t first_offset = batch_base + first_token * kChannels;
+      float history0 = load_as_float(qkv, first_offset - 3 * kChannels);
+      float history1 = load_as_float(qkv, first_offset - 2 * kChannels);
+      float history2 = load_as_float(qkv, first_offset - kChannels);
+#pragma unroll
+      for (int tile_token = 0; tile_token < kTimeTile; ++tile_token) {
+        const int64_t token = first_token + tile_token;
+        if (token < static_cast<int64_t>(token_count) - 1) {
+          const ptrdiff_t offset = first_offset + tile_token * kChannels;
+          const float current = load_as_float(qkv, offset);
+          const float result =
+              conv4_with_bias<T>(weight0, history0, weight1, history1, weight2,
+                                 history2, weight3, current, bias_value);
+          out[offset] = cast_from_float<T>(result);
+          history0 = history1;
+          history1 = history2;
+          history2 = current;
+        }
       }
     }
   }
@@ -505,7 +514,8 @@ __global__ __launch_bounds__(256) void causal_conv1d_k4_time_tiled_vec_kernel(
     ptrdiff_t out_s1, ptrdiff_t out_s2, ptrdiff_t state_s0, ptrdiff_t state_s1,
     ptrdiff_t state_s2, ptrdiff_t final_s0, ptrdiff_t final_s1,
     ptrdiff_t final_s2, ptrdiff_t qkv_s0, ptrdiff_t qkv_s1, ptrdiff_t qkv_s2,
-    ptrdiff_t weight_s0, ptrdiff_t weight_s2, ptrdiff_t bias_s0) {
+    ptrdiff_t weight_s0, ptrdiff_t weight_s2, ptrdiff_t bias_s0,
+    const T *history_snapshot) {
   constexpr int kChannelsPerBlock = kThreads * kVec;
   constexpr bool kSingleChunk = kIndexed && kTimeTile == 16;
 
@@ -552,8 +562,12 @@ __global__ __launch_bounds__(256) void causal_conv1d_k4_time_tiled_vec_kernel(
   float history1[kVec];
   float history2[kVec];
 
+  const T *history_source = history_snapshot ? history_snapshot : conv_state;
+  const ptrdiff_t history_s1 = history_snapshot ? 3 : state_s1;
+  const ptrdiff_t history_s2 = history_snapshot ? 1 : state_s2;
   const ptrdiff_t request_state_base =
-      static_cast<ptrdiff_t>(read_slot) * state_s0;
+      history_snapshot ? static_cast<ptrdiff_t>(request) * C * 3
+                       : static_cast<ptrdiff_t>(read_slot) * state_s0;
   const ptrdiff_t request_qkv_base = static_cast<ptrdiff_t>(request) * qkv_s0;
   const ptrdiff_t request_out_base = static_cast<ptrdiff_t>(request) * out_s0;
 
@@ -573,7 +587,7 @@ __global__ __launch_bounds__(256) void causal_conv1d_k4_time_tiled_vec_kernel(
     }
 
     const ptrdiff_t state_base =
-        request_state_base + static_cast<ptrdiff_t>(channel) * state_s1;
+        request_state_base + static_cast<ptrdiff_t>(channel) * history_s1;
     const ptrdiff_t weight_base = static_cast<ptrdiff_t>(channel) * weight_s0;
     w0[lane] = load_as_float(weight, weight_base);
     w1[lane] = load_as_float(weight, weight_base + weight_s2);
@@ -585,16 +599,19 @@ __global__ __launch_bounds__(256) void causal_conv1d_k4_time_tiled_vec_kernel(
             : 0.0f;
 
     if (chunk_start == 0) {
-      history0[lane] = load_as_float(conv_state, state_base);
-      history1[lane] = load_as_float(conv_state, state_base + state_s2);
-      history2[lane] = load_as_float(conv_state, state_base + 2 * state_s2);
+      history0[lane] = load_as_float(history_source, state_base);
+      history1[lane] = load_as_float(history_source, state_base + history_s2);
+      history2[lane] =
+          load_as_float(history_source, state_base + 2 * history_s2);
     } else if (chunk_start == 1) {
-      history0[lane] = load_as_float(conv_state, state_base + state_s2);
-      history1[lane] = load_as_float(conv_state, state_base + 2 * state_s2);
+      history0[lane] = load_as_float(history_source, state_base + history_s2);
+      history1[lane] =
+          load_as_float(history_source, state_base + 2 * history_s2);
       history2[lane] = load_as_float(
           qkv, request_qkv_base + static_cast<ptrdiff_t>(channel) * qkv_s2);
     } else if (chunk_start == 2) {
-      history0[lane] = load_as_float(conv_state, state_base + 2 * state_s2);
+      history0[lane] =
+          load_as_float(history_source, state_base + 2 * history_s2);
       history1[lane] = load_as_float(
           qkv, request_qkv_base + static_cast<ptrdiff_t>(channel) * qkv_s2);
       history2[lane] =
@@ -721,7 +738,8 @@ __global__ void causal_conv1d_k4_kernel(
     ptrdiff_t out_s1, ptrdiff_t out_s2, ptrdiff_t state_s0, ptrdiff_t state_s1,
     ptrdiff_t state_s2, ptrdiff_t final_s0, ptrdiff_t final_s1,
     ptrdiff_t final_s2, ptrdiff_t qkv_s0, ptrdiff_t qkv_s1, ptrdiff_t qkv_s2,
-    ptrdiff_t weight_s0, ptrdiff_t weight_s2, ptrdiff_t bias_s0) {
+    ptrdiff_t weight_s0, ptrdiff_t weight_s2, ptrdiff_t bias_s0,
+    const T *history_snapshot) {
   const int request = blockIdx.x;
   const int channel = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x);
   if (channel >= C) {
@@ -759,8 +777,12 @@ __global__ void causal_conv1d_k4_kernel(
     return;
   }
 
-  const ptrdiff_t state_base = static_cast<ptrdiff_t>(read_slot) * state_s0 +
-                               static_cast<ptrdiff_t>(channel) * state_s1;
+  const T *history_source = history_snapshot ? history_snapshot : conv_state;
+  const ptrdiff_t history_s2 = history_snapshot ? 1 : state_s2;
+  const ptrdiff_t state_base =
+      history_snapshot ? (static_cast<ptrdiff_t>(request) * C + channel) * 3
+                       : static_cast<ptrdiff_t>(read_slot) * state_s0 +
+                             static_cast<ptrdiff_t>(channel) * state_s1;
   const ptrdiff_t weight_base = static_cast<ptrdiff_t>(channel) * weight_s0;
   const float w0 = load_as_float(weight, weight_base);
   const float w1 = load_as_float(weight, weight_base + weight_s2);
@@ -770,9 +792,9 @@ __global__ void causal_conv1d_k4_kernel(
       has_bias ? load_as_float(bias, static_cast<ptrdiff_t>(channel) * bias_s0)
                : 0.0f;
 
-  float history0 = load_as_float(conv_state, state_base);
-  float history1 = load_as_float(conv_state, state_base + state_s2);
-  float history2 = load_as_float(conv_state, state_base + 2 * state_s2);
+  float history0 = load_as_float(history_source, state_base);
+  float history1 = load_as_float(history_source, state_base + history_s2);
+  float history2 = load_as_float(history_source, state_base + 2 * history_s2);
 
   ptrdiff_t qkv_offset = static_cast<ptrdiff_t>(token_batch) * qkv_s0 +
                          static_cast<ptrdiff_t>(token_begin) * qkv_s1 +
@@ -823,7 +845,7 @@ void launch_k4_time_tiled_vec_impl(const ConvInfo &info, void *out,
                                    const void *bias,
                                    const void *initial_state_indices,
                                    const void *final_state_indices,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, void *workspace) {
   constexpr unsigned int kChannelsPerBlock = kThreads * kVec;
 
   size_t time_chunks_size = (info.T + kTimeTile - 1) / kTimeTile;
@@ -840,58 +862,33 @@ void launch_k4_time_tiled_vec_impl(const ConvInfo &info, void *out,
                   static_cast<unsigned int>(time_chunks_size),
                   static_cast<unsigned int>(channel_chunks_size));
 
-  // If the final-state buffer aliases conv_state, the block holding the last
-  // token overwrites the history that the first chunk still has to read.
-  // Stage through a scratch buffer and copy back once the launch is done.
-  T *aliased_scratch = nullptr;
-  size_t aliased_elems = 0;
-  void *final_state_arg = final_conv_state;
-  if (final_conv_state != nullptr && final_conv_state == conv_state &&
-      time_chunks_size > 1) {
-    const size_t rows = info.pool_size ? info.pool_size : 1;
-    aliased_elems =
-        (rows - 1) * static_cast<size_t>(info.conv_state_strides[0]) +
-        (info.C ? info.C - 1 : 0) *
-            static_cast<size_t>(info.conv_state_strides[1]) +
-        2 * static_cast<size_t>(info.conv_state_strides[2]) + 1;
-    if (cudaMalloc(reinterpret_cast<void **>(&aliased_scratch),
-                   aliased_elems * sizeof(T)) == cudaSuccess) {
-      final_state_arg = aliased_scratch;
-    }
-  }
+  const ptrdiff_t final_s0 = info.final_conv_state_strides.empty()
+                                 ? 0
+                                 : info.final_conv_state_strides[0];
+  const ptrdiff_t final_s1 = info.final_conv_state_strides.empty()
+                                 ? 0
+                                 : info.final_conv_state_strides[1];
+  const ptrdiff_t final_s2 = info.final_conv_state_strides.empty()
+                                 ? 0
+                                 : info.final_conv_state_strides[2];
 
   causal_conv1d_k4_time_tiled_vec_kernel<T, kVec, kVectorIO, kTimeTile,
                                          kThreads, kIndexed>
       <<<grid, kThreads, 0, stream>>>(
           static_cast<T *>(out), static_cast<T *>(conv_state),
-          static_cast<T *>(final_state_arg), static_cast<const T *>(qkv),
+          static_cast<T *>(final_conv_state), static_cast<const T *>(qkv),
           static_cast<const T *>(weight), static_cast<const T *>(bias),
           initial_state_indices, final_state_indices, info.has_bias,
           info.initial_indices_kind == 2, info.final_indices_kind == 2, info.T,
           info.C, info.pool_size, info.out_strides[0], info.out_strides[1],
           info.out_strides[2], info.conv_state_strides[0],
-          info.conv_state_strides[1], info.conv_state_strides[2],
-          info.final_conv_state_strides.empty()
-              ? 0
-              : info.final_conv_state_strides[0],
-          info.final_conv_state_strides.empty()
-              ? 0
-              : info.final_conv_state_strides[1],
-          info.final_conv_state_strides.empty()
-              ? 0
-              : info.final_conv_state_strides[2],
-          info.qkv_strides[0], info.qkv_strides[1], info.qkv_strides[2],
-          info.weight_strides[0], info.weight_strides[2],
-          info.bias_strides.empty() ? 0 : info.bias_strides[0]);
-  if (cudaGetLastError() != cudaSuccess) {
-    if (aliased_scratch != nullptr) cudaFree(aliased_scratch);
-    throw std::runtime_error("Hygon causal conv1d vec launch failed");
-  }
-  if (aliased_scratch != nullptr) {
-    cudaMemcpyAsync(conv_state, aliased_scratch, aliased_elems * sizeof(T),
-                    cudaMemcpyDeviceToDevice, stream);
-    cudaFree(aliased_scratch);
-  }
+          info.conv_state_strides[1], info.conv_state_strides[2], final_s0,
+          final_s1, final_s2, info.qkv_strides[0], info.qkv_strides[1],
+          info.qkv_strides[2], info.weight_strides[0], info.weight_strides[2],
+          info.bias_strides.empty() ? 0 : info.bias_strides[0],
+          static_cast<const T *>(info.history));
+  if (cudaGetLastError() != cudaSuccess)
+    throw std::runtime_error("Hygon causal conv vec launch failed");
 }
 
 template <typename T>
@@ -912,23 +909,21 @@ bool can_use_k4_vector_io(const ConvInfo &info, const void *out,
 }
 
 template <typename T, int kTimeTile, int kThreads, int kVec, bool kIndexed>
-void launch_k4_time_tiled_vec_for_tile(const ConvInfo &info, void *out,
-                                       void *conv_state, void *final_conv_state,
-                                       const void *qkv, const void *weight,
-                                       const void *bias,
-                                       const void *initial_state_indices,
-                                       const void *final_state_indices,
-                                       cudaStream_t stream, bool vector_io) {
+void launch_k4_time_tiled_vec_for_tile(
+    const ConvInfo &info, void *out, void *conv_state, void *final_conv_state,
+    const void *qkv, const void *weight, const void *bias,
+    const void *initial_state_indices, const void *final_state_indices,
+    cudaStream_t stream, bool vector_io, void *workspace) {
   if (vector_io) {
     return launch_k4_time_tiled_vec_impl<T, true, kTimeTile, kThreads, kVec,
                                          kIndexed>(
         info, out, conv_state, final_conv_state, qkv, weight, bias,
-        initial_state_indices, final_state_indices, stream);
+        initial_state_indices, final_state_indices, stream, workspace);
   }
   return launch_k4_time_tiled_vec_impl<T, false, kTimeTile, kThreads, kVec,
                                        kIndexed>(
       info, out, conv_state, final_conv_state, qkv, weight, bias,
-      initial_state_indices, final_state_indices, stream);
+      initial_state_indices, final_state_indices, stream, workspace);
 }
 
 template <typename T, int kTimeTile, bool kIndexed>
@@ -936,30 +931,31 @@ void launch_k4_time_tiled_vec_for_channels(
     const ConvInfo &info, void *out, void *conv_state, void *final_conv_state,
     const void *qkv, const void *weight, const void *bias,
     const void *initial_state_indices, const void *final_state_indices,
-    cudaStream_t stream, bool vector_io) {
+    cudaStream_t stream, bool vector_io, void *workspace) {
   if constexpr (kIndexed) {
     return launch_k4_time_tiled_vec_impl<T, false, kTimeTile, 64, 1, true>(
         info, out, conv_state, final_conv_state, qkv, weight, bias,
-        initial_state_indices, final_state_indices, stream);
+        initial_state_indices, final_state_indices, stream, workspace);
   }
   if (info.C <= 512) {
     constexpr int kSmallVec = sizeof(T) == 4 ? 2 : 4;
     return launch_k4_time_tiled_vec_impl<T, false, kTimeTile, 64, kSmallVec,
                                          kIndexed>(
         info, out, conv_state, final_conv_state, qkv, weight, bias,
-        initial_state_indices, final_state_indices, stream);
+        initial_state_indices, final_state_indices, stream, workspace);
   }
   constexpr int kFullVec = sizeof(T) == 4 ? 4 : 8;
   if (info.C <= 4096) {
     return launch_k4_time_tiled_vec_for_tile<T, kTimeTile, 128, kFullVec,
                                              kIndexed>(
         info, out, conv_state, final_conv_state, qkv, weight, bias,
-        initial_state_indices, final_state_indices, stream, vector_io);
+        initial_state_indices, final_state_indices, stream, vector_io,
+        workspace);
   }
   return launch_k4_time_tiled_vec_for_tile<T, kTimeTile, 256, kFullVec,
                                            kIndexed>(
       info, out, conv_state, final_conv_state, qkv, weight, bias,
-      initial_state_indices, final_state_indices, stream, vector_io);
+      initial_state_indices, final_state_indices, stream, vector_io, workspace);
 }
 
 template <typename T, bool kIndexed>
@@ -968,30 +964,26 @@ void launch_k4_time_tiled_vec(const ConvInfo &info, void *out, void *conv_state,
                               const void *weight, const void *bias,
                               const void *initial_state_indices,
                               const void *final_state_indices,
-                              cudaStream_t stream, bool vector_io) {
-  if constexpr (kIndexed) {
-    if (info.T == 16) {
-      return launch_k4_time_tiled_vec_for_channels<T, 4, true>(
-          info, out, conv_state, final_conv_state, qkv, weight, bias,
-          initial_state_indices, final_state_indices, stream, vector_io);
-    }
-  }
+                              cudaStream_t stream, bool vector_io,
+                              void *workspace) {
   if (info.T <= 16) {
     return launch_k4_time_tiled_vec_for_channels<T, 16, kIndexed>(
         info, out, conv_state, final_conv_state, qkv, weight, bias,
-        initial_state_indices, final_state_indices, stream, vector_io);
+        initial_state_indices, final_state_indices, stream, vector_io,
+        workspace);
   }
   if (info.T <= 64) {
     return launch_k4_time_tiled_vec_for_channels<T, 64, kIndexed>(
         info, out, conv_state, final_conv_state, qkv, weight, bias,
-        initial_state_indices, final_state_indices, stream, vector_io);
+        initial_state_indices, final_state_indices, stream, vector_io,
+        workspace);
   }
   return launch_k4_time_tiled_vec_for_channels<T, 128, kIndexed>(
       info, out, conv_state, final_conv_state, qkv, weight, bias,
-      initial_state_indices, final_state_indices, stream, vector_io);
+      initial_state_indices, final_state_indices, stream, vector_io, workspace);
 }
 
-template <typename T, int kTimeTile>
+template <typename T, int kTimeTile, int kChannelsPerThread>
 void launch_k4_contiguous_tiled(const ConvInfo &info, void *out,
                                 void *conv_state, const void *qkv,
                                 const void *weight, const void *bias,
@@ -1000,57 +992,73 @@ void launch_k4_contiguous_tiled(const ConvInfo &info, void *out,
                                 cudaStream_t stream) {
   const size_t middle_chunks =
       info.T < 4 ? 0 : (info.T - 4 + kTimeTile - 1) / kTimeTile;
-  const dim3 grid(static_cast<unsigned int>(info.request_count),
-                  static_cast<unsigned int>(1 + middle_chunks), 64);
-  causal_conv1d_k4_contiguous_tiled_kernel<T, kTimeTile>
-      <<<grid, 64, 0, stream>>>(
-          static_cast<T *>(out), static_cast<T *>(conv_state),
-          static_cast<const T *>(qkv), static_cast<const T *>(weight),
-          static_cast<const T *>(bias),
-          static_cast<const int32_t *>(initial_state_indices),
-          static_cast<const int32_t *>(final_state_indices), info.T,
-          info.pool_size);
-  if (cudaGetLastError() != cudaSuccess)
-    throw std::runtime_error("Hygon causal conv1d tiled launch failed");
-}
-
-template <typename T, int kChannelsPerThread>
-void launch_k4_lowp_t16(const ConvInfo &info, void *out, void *conv_state,
-                        const void *qkv, const void *weight, const void *bias,
-                        const void *initial_state_indices,
-                        const void *final_state_indices, cudaStream_t stream) {
-  constexpr unsigned int kThreads = 64;
-  const dim3 grid(
-      static_cast<unsigned int>(info.request_count), 4,
-      (static_cast<unsigned int>(info.C) + kThreads * kChannelsPerThread - 1) /
-          (kThreads * kChannelsPerThread));
-  if (initial_state_indices == nullptr) {
-    causal_conv1d_k4_lowp_contiguous_t16_kernel<T, false, kChannelsPerThread>
-        <<<grid, kThreads, 0, stream>>>(
-            static_cast<T *>(out), static_cast<T *>(conv_state),
-            static_cast<const T *>(qkv), static_cast<const T *>(weight),
-            static_cast<const T *>(bias), nullptr,
-            static_cast<const int32_t *>(final_state_indices), info.pool_size);
-  } else {
-    causal_conv1d_k4_lowp_contiguous_t16_kernel<T, true, kChannelsPerThread>
-        <<<grid, kThreads, 0, stream>>>(
+  const dim3 grid(static_cast<unsigned>(info.request_count),
+                  static_cast<unsigned>(1 + middle_chunks),
+                  4096 / (64 * kChannelsPerThread));
+  const auto launch = [&](auto has_initial) {
+    causal_conv1d_k4_contiguous_tiled_kernel<T, kTimeTile, kChannelsPerThread,
+                                             decltype(has_initial)::value>
+        <<<grid, 64, 0, stream>>>(
             static_cast<T *>(out), static_cast<T *>(conv_state),
             static_cast<const T *>(qkv), static_cast<const T *>(weight),
             static_cast<const T *>(bias),
             static_cast<const int32_t *>(initial_state_indices),
-            static_cast<const int32_t *>(final_state_indices), info.pool_size);
-  }
+            static_cast<const int32_t *>(final_state_indices), info.T,
+            info.pool_size, static_cast<const T *>(info.history));
+  };
+  if (initial_state_indices)
+    launch(std::true_type{});
+  else
+    launch(std::false_type{});
   if (cudaGetLastError() != cudaSuccess)
-    throw std::runtime_error("Hygon causal conv1d T16 launch failed");
+    throw std::runtime_error("Hygon causal conv contiguous launch failed");
+}
+
+// Resource-based policy shared by neighboring B/T values. BF16 conversion
+// pressure needs more independent blocks before increasing channels/thread.
+template <typename T, int kTimeTile>
+void launch_k4_contiguous_family(const ConvInfo &info, void *out,
+                                 void *conv_state, const void *qkv,
+                                 const void *weight, const void *bias,
+                                 const void *initial_state_indices,
+                                 const void *final_state_indices,
+                                 cudaStream_t stream) {
+  const size_t time_blocks =
+      1 + (info.T < 4 ? 0 : (info.T - 4 + kTimeTile - 1) / kTimeTile);
+  constexpr size_t kBlocksPerCu = std::is_same_v<T, __nv_bfloat16> ? 8 : 2;
+  const size_t paired_blocks = info.request_count * (4096 / 128) * time_blocks;
+  if (paired_blocks >= static_cast<size_t>(info.compute_units) * kBlocksPerCu)
+    return launch_k4_contiguous_tiled<T, kTimeTile, 2>(
+        info, out, conv_state, qkv, weight, bias, initial_state_indices,
+        final_state_indices, stream);
+  return launch_k4_contiguous_tiled<T, kTimeTile, 1>(
+      info, out, conv_state, qkv, weight, bias, initial_state_indices,
+      final_state_indices, stream);
 }
 
 template <typename T>
-void launch_k4(const ConvInfo &info, void *out, void *conv_state,
-               void *final_conv_state, const void *qkv, const void *weight,
-               const void *bias, const void *cu_seqlens,
-               const void *initial_state_indices,
-               const void *final_state_indices, cudaStream_t stream) {
+void launch_k4_impl(const ConvInfo &info, void *out, void *conv_state,
+                    void *final_conv_state, const void *qkv, const void *weight,
+                    const void *bias, const void *cu_seqlens,
+                    const void *initial_state_indices,
+                    const void *final_state_indices, cudaStream_t stream,
+                    void *workspace) {
+  const size_t generic_tile = info.T <= 16 ? 16 : info.T <= 64 ? 64 : 128;
+  const bool tiled_grid_fits =
+      (info.T + generic_tile - 1) / generic_tile <= 65535;
+  const size_t contiguous_tile = info.T <= 16 ? 4 : info.T <= 64 ? 8 : 16;
+  const size_t contiguous_blocks =
+      1 +
+      (info.T < 4 ? 0 : (info.T - 4 + contiguous_tile - 1) / contiguous_tile);
+  // The regular template updates history in its first block after consuming
+  // it. Generic multi-tile indexed writes would race the first tile's reads;
+  // keep that layout on the one-thread-per-channel recurrence instead.
+  const bool history_tile_safe =
+      info.history != nullptr || final_state_indices == nullptr ||
+      info.T <= 128 ||
+      (has_indexed_k4_layout(info) && contiguous_blocks <= 65535);
   if (!info.has_cu_seqlens && cu_seqlens == nullptr && out != qkv &&
+      tiled_grid_fits && history_tile_safe &&
       (final_state_indices != nullptr ||
        !info.final_conv_state_strides.empty()) &&
       info.qkv_strides[2] == 1 && info.out_strides[2] == 1) {
@@ -1059,118 +1067,66 @@ void launch_k4(const ConvInfo &info, void *out, void *conv_state,
         final_state_indices != nullptr && bias != nullptr) {
       if constexpr (sizeof(T) == 2) {
         if (info.T == 1 && info.request_count <= 65535) {
-          if ((info.request_count == 1 || info.request_count == 4 ||
-               info.request_count == 8) &&
-              (reinterpret_cast<uintptr_t>(out) & 3) == 0 &&
+          if ((reinterpret_cast<uintptr_t>(out) & 3) == 0 &&
               (reinterpret_cast<uintptr_t>(conv_state) & 3) == 0 &&
               (reinterpret_cast<uintptr_t>(qkv) & 3) == 0 &&
               (reinterpret_cast<uintptr_t>(bias) & 3) == 0 &&
               (reinterpret_cast<uintptr_t>(weight) & 15) == 0) {
-            // A single request with a one-row pool has constant state offsets.
-            // Keep device index validation even when the offsets are constant.
-            const auto launch_pair = [&](auto single_pool) {
-              constexpr int kPairThreads = 128;
-              constexpr bool kSingleRequestPool = decltype(single_pool)::value;
-              causal_conv1d_k4_decode_pair_kernel<T, kPairThreads,
-                                                  kSingleRequestPool>
-                  <<<dim3(4096 / (kPairThreads * 2), info.request_count),
-                     kPairThreads, 0, stream>>>(
-                      static_cast<T *>(out), static_cast<T *>(conv_state),
-                      static_cast<const T *>(qkv),
-                      static_cast<const T *>(weight),
-                      static_cast<const T *>(bias),
-                      static_cast<const int32_t *>(initial_state_indices),
-                      static_cast<const int32_t *>(final_state_indices),
-                      info.pool_size);
-            };
-            if (info.request_count == 1 && info.pool_size == 1)
-              launch_pair(std::true_type{});
-            else
-              launch_pair(std::false_type{});
-            if (cudaGetLastError() != cudaSuccess)
-              throw std::runtime_error(
-                  "Hygon causal conv1d decode pair launch failed");
-            return;
+            constexpr int kThreads = 128;
+            causal_conv1d_k4_decode_pair_kernel<T, kThreads>
+                <<<dim3(4096 / (kThreads * 2), info.request_count), kThreads, 0,
+                   stream>>>(
+                    static_cast<T *>(out), static_cast<T *>(conv_state),
+                    static_cast<const T *>(qkv), static_cast<const T *>(weight),
+                    static_cast<const T *>(bias),
+                    static_cast<const int32_t *>(initial_state_indices),
+                    static_cast<const int32_t *>(final_state_indices),
+                    info.pool_size, static_cast<const T *>(info.history));
+          } else {
+            constexpr int kThreads = 64;
+            causal_conv1d_k4_decode_kernel<T, kThreads>
+                <<<dim3(4096 / kThreads, info.request_count), kThreads, 0,
+                   stream>>>(
+                    static_cast<T *>(out), static_cast<T *>(conv_state),
+                    static_cast<const T *>(qkv), static_cast<const T *>(weight),
+                    static_cast<const T *>(bias),
+                    static_cast<const int32_t *>(initial_state_indices),
+                    static_cast<const int32_t *>(final_state_indices),
+                    info.pool_size, static_cast<const T *>(info.history));
           }
-          constexpr int kThreads = 64;
-          causal_conv1d_k4_decode_kernel<T, kThreads>
-              <<<dim3(4096 / kThreads, info.request_count), kThreads, 0,
-                 stream>>>(static_cast<T *>(out), static_cast<T *>(conv_state),
-                           static_cast<const T *>(qkv),
-                           static_cast<const T *>(weight),
-                           static_cast<const T *>(bias),
-                           static_cast<const int32_t *>(initial_state_indices),
-                           static_cast<const int32_t *>(final_state_indices),
-                           info.pool_size);
           if (cudaGetLastError() != cudaSuccess)
-            throw std::runtime_error(
-                "Hygon causal conv1d decode launch failed");
+            throw std::runtime_error("Hygon causal conv decode launch failed");
           return;
         }
-        if (info.T == 16) {
-          // Small F16 batches favor more independent channel blocks;
-          // BF16 B8 benefits from two channels per thread.
-          if constexpr (std::is_same_v<T, half>) {
-            if (info.request_count == 1)
-              return launch_k4_lowp_t16<T, 1>(
-                  info, out, conv_state, qkv, weight, bias,
-                  initial_state_indices, final_state_indices, stream);
-            return launch_k4_lowp_t16<T, 2>(info, out, conv_state, qkv, weight,
-                                            bias, initial_state_indices,
-                                            final_state_indices, stream);
-          } else {
-            if (info.request_count == 8)
-              return launch_k4_lowp_t16<T, 2>(
-                  info, out, conv_state, qkv, weight, bias,
-                  initial_state_indices, final_state_indices, stream);
-            return launch_k4_lowp_t16<T, 1>(info, out, conv_state, qkv, weight,
-                                            bias, initial_state_indices,
-                                            final_state_indices, stream);
-          }
-        }
       }
-      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-        if (info.request_count == 4 && info.T == 128)
-          return launch_k4_contiguous_tiled<T, 16>(
+      const int tile = info.T <= 16 ? 4 : info.T <= 64 ? 8 : 16;
+      const size_t blocks =
+          1 + (info.T < 4 ? 0 : (info.T - 4 + tile - 1) / tile);
+      if (blocks <= 65535) {
+        if (tile == 4)
+          return launch_k4_contiguous_family<T, 4>(
               info, out, conv_state, qkv, weight, bias, initial_state_indices,
               final_state_indices, stream);
-      }
-      if (info.T <= 16) {
-        return launch_k4_contiguous_tiled<T, 4>(
+        if (tile == 8)
+          return launch_k4_contiguous_family<T, 8>(
+              info, out, conv_state, qkv, weight, bias, initial_state_indices,
+              final_state_indices, stream);
+        return launch_k4_contiguous_family<T, 16>(
             info, out, conv_state, qkv, weight, bias, initial_state_indices,
             final_state_indices, stream);
       }
-      if (info.request_count == 1 && info.T <= 64) {
-        return launch_k4_contiguous_tiled<T, 4>(
-            info, out, conv_state, qkv, weight, bias, initial_state_indices,
-            final_state_indices, stream);
-      }
-      if (info.request_count > 1 && info.request_count <= 4 &&
-          (info.T < 128 || !std::is_same_v<T, half>)) {
-        return launch_k4_contiguous_tiled<T, 8>(
-            info, out, conv_state, qkv, weight, bias, initial_state_indices,
-            final_state_indices, stream);
-      }
-      if (info.request_count == 1 && info.T == 128) {
-        return launch_k4_contiguous_tiled<T, 8>(
-            info, out, conv_state, qkv, weight, bias, initial_state_indices,
-            final_state_indices, stream);
-      }
-      return launch_k4_contiguous_tiled<T, 16>(
-          info, out, conv_state, qkv, weight, bias, initial_state_indices,
-          final_state_indices, stream);
     }
     const bool vector_io = can_use_k4_vector_io<T>(info, out, qkv);
-    if (info.indexed_state_pool) {
+    if (info.indexed_state_pool)
       return launch_k4_time_tiled_vec<T, true>(
           info, out, conv_state, final_conv_state, qkv, weight, bias,
-          initial_state_indices, final_state_indices, stream, vector_io);
-    }
+          initial_state_indices, final_state_indices, stream, vector_io,
+          workspace);
     return launch_k4_time_tiled_vec<T, false>(
         info, out, conv_state, final_conv_state, qkv, weight, bias,
-        initial_state_indices, final_state_indices, stream, vector_io);
+        initial_state_indices, final_state_indices, stream, vector_io,
+        workspace);
   }
-
   constexpr unsigned int threads = 128;
   dim3 grid(static_cast<unsigned int>(info.request_count),
             (static_cast<unsigned int>(info.C) + threads - 1) / threads, 1);
@@ -1193,10 +1149,205 @@ void launch_k4(const ConvInfo &info, void *out, void *conv_state,
                                             : info.final_conv_state_strides[2],
       info.qkv_strides[0], info.qkv_strides[1], info.qkv_strides[2],
       info.weight_strides[0], info.weight_strides[2],
-      info.bias_strides.empty() ? 0 : info.bias_strides[0]);
+      info.bias_strides.empty() ? 0 : info.bias_strides[0],
+      static_cast<const T *>(info.history));
   if (cudaGetLastError() != cudaSuccess)
     throw std::runtime_error("Hygon causal conv1d launch failed");
 }
+
+// Snapshot before any request can write the shared pool. This also protects
+// aliased explicit final-state views and arbitrary initial-slot permutations.
+template <typename T>
+__global__ void causal_conv1d_snapshot_history(T *snapshot, const T *state,
+                                               const void *initial_indices,
+                                               bool indices_i64, size_t count,
+                                               size_t channels,
+                                               size_t pool_size, ptrdiff_t s0,
+                                               ptrdiff_t s1, ptrdiff_t s2) {
+  for (size_t linear =
+           static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       linear < count; linear += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const size_t request = linear / (channels * 3);
+    const int64_t slot =
+        load_optional_index(initial_indices, indices_i64, request, request);
+    if (slot < 0 || static_cast<size_t>(slot) >= pool_size) continue;
+    snapshot[linear] =
+        state[static_cast<ptrdiff_t>(slot) * s0 +
+              static_cast<ptrdiff_t>((linear / 3) % channels) * s1 +
+              static_cast<ptrdiff_t>(linear % 3) * s2];
+  }
+}
+
+// One block owns a channel tile across all requests. The barrier protects
+// every initial-slot read from every final-slot write, including permutations.
+// This short recurrence needs no separate snapshot node or global workspace.
+constexpr int kPoolChannelsPerBlock = 32;
+constexpr int kMaxPoolRequestCapacity = 32;
+
+inline int short_pool_capacity(const ConvInfo &info) {
+  if (info.has_cu_seqlens || !info.final_indices_kind ||
+      info.request_count <= 1 || info.request_count > kMaxPoolRequestCapacity ||
+      info.T > 4)
+    return 0;
+  int capacity = 2;
+  while (capacity < info.request_count) capacity *= 2;
+  return capacity * kPoolChannelsPerBlock <= info.max_threads_per_block
+             ? capacity
+             : 0;
+}
+
+template <typename T, int kRequestCapacity>
+__global__
+__launch_bounds__(kRequestCapacity *kPoolChannelsPerBlock) void causal_conv1d_k4_short_pool_kernel(
+    T *out, T *state, const T *x, const T *weight, const T *bias,
+    const void *initial_indices, const void *final_indices, bool initial_i64,
+    bool final_i64, size_t requests, size_t tokens, size_t channels,
+    size_t pool_size, ptrdiff_t x0, ptrdiff_t x1, ptrdiff_t x2, ptrdiff_t o0,
+    ptrdiff_t o1, ptrdiff_t o2, ptrdiff_t s0, ptrdiff_t s1, ptrdiff_t s2,
+    ptrdiff_t w0, ptrdiff_t w2, ptrdiff_t b0) {
+  const int request = threadIdx.x / kPoolChannelsPerBlock;
+  const size_t channel =
+      static_cast<size_t>(blockIdx.x) * kPoolChannelsPerBlock +
+      threadIdx.x % kPoolChannelsPerBlock;
+  bool active = request < requests && channel < channels;
+  int64_t read_slot = 0, write_slot = 0;
+  float h0 = 0.0f, h1 = 0.0f, h2 = 0.0f;
+  if (active) {
+    read_slot =
+        load_optional_index(initial_indices, initial_i64, request, request);
+    write_slot =
+        load_optional_index(final_indices, final_i64, request, request);
+    active = read_slot >= 0 && write_slot >= 0 &&
+             static_cast<size_t>(read_slot) < pool_size &&
+             static_cast<size_t>(write_slot) < pool_size;
+    if (active) {
+      const ptrdiff_t base = read_slot * s0 + channel * s1;
+      h0 = load_as_float(state, base);
+      h1 = load_as_float(state, base + s2);
+      h2 = load_as_float(state, base + 2 * s2);
+    }
+  }
+  // Padding and invalid-slot threads must participate before returning.
+  __syncthreads();
+  if (!active) return;
+  const ptrdiff_t wb = channel * w0;
+  const float a0 = load_as_float(weight, wb);
+  const float a1 = load_as_float(weight, wb + w2);
+  const float a2 = load_as_float(weight, wb + 2 * w2);
+  const float a3 = load_as_float(weight, wb + 3 * w2);
+  const float bias_value = bias ? load_as_float(bias, channel * b0) : 0.0f;
+  ptrdiff_t input = static_cast<ptrdiff_t>(request) * x0 + channel * x2;
+  ptrdiff_t output = static_cast<ptrdiff_t>(request) * o0 + channel * o2;
+  for (size_t token = 0; token < tokens; ++token) {
+    const float value = load_as_float(x, input);
+    out[output] = cast_from_float<T>(
+        conv4_with_bias<T>(a0, h0, a1, h1, a2, h2, a3, value, bias_value));
+    h0 = h1;
+    h1 = h2;
+    h2 = value;
+    input += x1;
+    output += o1;
+  }
+  const ptrdiff_t target = write_slot * s0 + channel * s1;
+  state[target] = cast_from_float<T>(h0);
+  state[target + s2] = cast_from_float<T>(h1);
+  state[target + 2 * s2] = cast_from_float<T>(h2);
+}
+
+template <typename T, int kCapacity>
+void launch_short_pool(const ConvInfo &p, void *out, void *state, const void *x,
+                       const void *weight, const void *bias,
+                       const void *initial, const void *final,
+                       cudaStream_t stream) {
+  causal_conv1d_k4_short_pool_kernel<T, kCapacity>
+      <<<static_cast<unsigned>((p.C + kPoolChannelsPerBlock - 1) /
+                               kPoolChannelsPerBlock),
+         kCapacity * kPoolChannelsPerBlock, 0, stream>>>(
+          static_cast<T *>(out), static_cast<T *>(state),
+          static_cast<const T *>(x), static_cast<const T *>(weight),
+          static_cast<const T *>(bias), initial, final,
+          p.initial_indices_kind == 2, p.final_indices_kind == 2,
+          p.request_count, p.T, p.C, p.pool_size, p.qkv_strides[0],
+          p.qkv_strides[1], p.qkv_strides[2], p.out_strides[0],
+          p.out_strides[1], p.out_strides[2], p.conv_state_strides[0],
+          p.conv_state_strides[1], p.conv_state_strides[2], p.weight_strides[0],
+          p.weight_strides[2], p.bias_strides.empty() ? 0 : p.bias_strides[0]);
+  if (cudaGetLastError() != cudaSuccess)
+    throw std::runtime_error("Hygon causal conv short pool launch failed");
+}
+
+inline bool needs_history_snapshot(const ConvInfo &info, const void *state,
+                                   const void *final_state,
+                                   const void *initial_indices,
+                                   const void *final_indices) {
+  // Identical index views map each request back to its own initial row.
+  // As in the public state-pool API, concurrent final slots must be unique.
+  const bool same_indices =
+      initial_indices && initial_indices == final_indices &&
+      info.initial_indices_kind == info.final_indices_kind;
+  return (final_indices && info.request_count > 1 && !same_indices &&
+          !short_pool_capacity(info)) ||
+         (final_state == state && final_state &&
+          ((initial_indices && info.request_count > 1) ||
+           (!info.has_cu_seqlens && info.T > 128)));
+}
+
+template <typename T>
+void launch_k4(const ConvInfo &info, void *out, void *conv_state,
+               void *final_conv_state, const void *qkv, const void *weight,
+               const void *bias, const void *cu_seqlens,
+               const void *initial_state_indices,
+               const void *final_state_indices, cudaStream_t stream,
+               void *workspace) {
+  if (final_state_indices && !cu_seqlens) {
+    switch (short_pool_capacity(info)) {
+      case 2:
+        return launch_short_pool<T, 2>(info, out, conv_state, qkv, weight, bias,
+                                       initial_state_indices,
+                                       final_state_indices, stream);
+      case 4:
+        return launch_short_pool<T, 4>(info, out, conv_state, qkv, weight, bias,
+                                       initial_state_indices,
+                                       final_state_indices, stream);
+      case 8:
+        return launch_short_pool<T, 8>(info, out, conv_state, qkv, weight, bias,
+                                       initial_state_indices,
+                                       final_state_indices, stream);
+      case 16:
+        return launch_short_pool<T, 16>(info, out, conv_state, qkv, weight,
+                                        bias, initial_state_indices,
+                                        final_state_indices, stream);
+      case 32:
+        return launch_short_pool<T, 32>(info, out, conv_state, qkv, weight,
+                                        bias, initial_state_indices,
+                                        final_state_indices, stream);
+      default:
+        break;
+    }
+  }
+  if (!needs_history_snapshot(info, conv_state, final_conv_state,
+                              initial_state_indices, final_state_indices))
+    return launch_k4_impl<T>(info, out, conv_state, final_conv_state, qkv,
+                             weight, bias, cu_seqlens, initial_state_indices,
+                             final_state_indices, stream, workspace);
+  const size_t count = info.request_count * info.C * 3;
+  causal_conv1d_snapshot_history<T>
+      <<<static_cast<unsigned>(std::min<size_t>(65535, (count + 255) / 256)),
+         256, 0, stream>>>(
+          static_cast<T *>(workspace), static_cast<const T *>(conv_state),
+          initial_state_indices, info.initial_indices_kind == 2, count, info.C,
+          info.pool_size, info.conv_state_strides[0],
+          info.conv_state_strides[1], info.conv_state_strides[2]);
+  if (cudaGetLastError() != cudaSuccess)
+    throw std::runtime_error(
+        "Hygon causal conv history snapshot launch failed");
+  ConvInfo staged_info = info;
+  staged_info.history = workspace;
+  launch_k4_impl<T>(staged_info, out, conv_state, final_conv_state, qkv, weight,
+                    bias, cu_seqlens, initial_state_indices,
+                    final_state_indices, stream, workspace);
+}
+
 }  // namespace
 }  // namespace hygon_conv_detail
 
@@ -1209,7 +1360,11 @@ class Operator<CausalConv1d, Device::Type::kHygon> : public CausalConv1d {
            const std::optional<Tensor> initial_state_indices,
            const std::optional<Tensor> final_state_indices, Tensor out,
            std::optional<Tensor> final_conv_state)
-      : CausalConv1d(qkv, weight, conv_state, bias, cu_seqlens,
+      : CausalConv1d(hygon_conv_detail::checked_input(
+                         qkv, weight, conv_state, bias, cu_seqlens,
+                         initial_state_indices, final_state_indices, out,
+                         final_conv_state),
+                     weight, conv_state, bias, cu_seqlens,
                      initial_state_indices, final_state_indices, out,
                      final_conv_state) {
     if (device_.type() != Device::Type::kHygon)
@@ -1218,9 +1373,15 @@ class Operator<CausalConv1d, Device::Type::kHygon> : public CausalConv1d {
       throw std::invalid_argument(
           "Hygon causal conv kernel requires K4 and state_len3");
     check_device();
-    if (requests_ >= static_cast<size_t>(INT_MAX) || channels_ > 65535)
+    if (requests_ >= static_cast<size_t>(INT_MAX) || channels_ > 65535u * 128u)
       throw std::invalid_argument(
           "Hygon causal conv request/channel launch extent unsupported");
+    cudaDeviceProp properties{};
+    if (cudaGetDeviceProperties(&properties, device_.index()) != cudaSuccess)
+      throw std::runtime_error(
+          "Hygon causal conv device properties unavailable");
+    info_.compute_units = std::max(1, properties.multiProcessorCount);
+    info_.max_threads_per_block = properties.maxThreadsPerBlock;
     info_.request_count = requests_;
     info_.T = tokens_;
     info_.C = channels_;
@@ -1251,13 +1412,30 @@ class Operator<CausalConv1d, Device::Type::kHygon> : public CausalConv1d {
     if (final_conv_state)
       for (auto s : final_conv_state->strides())
         info_.final_conv_state_strides.push_back(s);
-    // Only these metadata shapes are advertised for device-graph capture.
-    decode_capture_safe_ =
-        hygon_conv_detail::has_indexed_k4_layout(info_) &&
-        (info_.T == 1 || info_.T == 16 || info_.T == 128) &&
-        (info_.request_count == 1 || info_.request_count == 4 ||
-         info_.request_count == 8) &&
-        (dtype_ == DataType::kFloat16 || dtype_ == DataType::kBFloat16);
+    for (size_t i = 0; i < metadata_.size(); ++i)
+      if (metadata_[i] && metadata_[i]->numel()) {
+        size_t span = 1;
+        for (size_t axis = 0; axis < metadata_[i]->ndim(); ++axis)
+          span += (metadata_[i]->size(axis) - 1) * metadata_[i]->stride(axis);
+        const auto type = metadata_[i]->dtype();
+        spans_[i] =
+            span * (type == DataType::kInt64 ? 8
+                    : type == DataType::kFloat32 || type == DataType::kInt32
+                        ? 4
+                        : 2);
+      }
+    // Reserve the worst case for this metadata signature. Pointer aliases
+    // and identical index buffers are checked again on every invocation.
+    if ((final_state_indices && requests_ > 1 &&
+         !hygon_conv_detail::short_pool_capacity(info_)) ||
+        (final_conv_state && ((initial_state_indices && requests_ > 1) ||
+                              (!cu_seqlens && tokens_ > 128)))) {
+      const size_t width = dtype_ == DataType::kFloat32 ? 4 : 2;
+      if (requests_ && channels_ > std::numeric_limits<size_t>::max() /
+                                       requests_ / 3 / width)
+        throw std::overflow_error("Hygon causal conv workspace size overflow");
+      workspace_bytes_ = requests_ * channels_ * 3 * width;
+    }
   }
 
   void operator()(const Tensor qkv, const Tensor weight, Tensor conv_state,
@@ -1285,6 +1463,15 @@ class Operator<CausalConv1d, Device::Type::kHygon> : public CausalConv1d {
     }
     check_device();
     if (!requests_ || !channels_) return;
+    check_aliases_(views);
+    if (hygon_conv_detail::needs_history_snapshot(
+            info_, conv_state.data(),
+            final_conv_state ? final_conv_state->data() : nullptr,
+            initial_state_indices ? initial_state_indices->data() : nullptr,
+            final_state_indices ? final_state_indices->data() : nullptr) &&
+        (workspace_ == nullptr || workspace_size_in_bytes_ < workspace_bytes_))
+      throw std::invalid_argument(
+          "Hygon causal conv workspace is missing or too small");
     auto ptr = [&](size_t i) -> void * {
       return views[i] ? const_cast<void *>(views[i]->data()) : nullptr;
     };
@@ -1293,29 +1480,56 @@ class Operator<CausalConv1d, Device::Type::kHygon> : public CausalConv1d {
       case DataType::kFloat32:
         hygon_conv_detail::launch_k4<float>(info_, ptr(7), ptr(2), ptr(8),
                                             ptr(0), ptr(1), ptr(3), ptr(4),
-                                            ptr(5), ptr(6), stream);
+                                            ptr(5), ptr(6), stream, workspace_);
         break;
       case DataType::kFloat16:
         hygon_conv_detail::launch_k4<half>(info_, ptr(7), ptr(2), ptr(8),
                                            ptr(0), ptr(1), ptr(3), ptr(4),
-                                           ptr(5), ptr(6), stream);
+                                           ptr(5), ptr(6), stream, workspace_);
         break;
       case DataType::kBFloat16:
         hygon_conv_detail::launch_k4<__nv_bfloat16>(
             info_, ptr(7), ptr(2), ptr(8), ptr(0), ptr(1), ptr(3), ptr(4),
-            ptr(5), ptr(6), stream);
+            ptr(5), ptr(6), stream, workspace_);
         break;
       default:
         throw std::invalid_argument("Hygon causal conv dtype unsupported");
     }
   }
 
-  bool capture_safe() const override { return decode_capture_safe_; }
+  std::size_t workspace_size_in_bytes() const override {
+    return workspace_bytes_;
+  }
+
+  // Every execution path submits GPU work only. Required workspace is
+  // reported during preparation and owned by the caller/recorded Runtime.
+  bool capture_safe() const override { return true; }
 
  private:
   hygon_conv_detail::ConvInfo info_{};
-  // Canonical indexed K4 kernels launch only GPU work after construction.
-  bool decode_capture_safe_ = false;
+  std::size_t workspace_bytes_ = 0;
+  std::array<size_t, 9> spans_{};
+  void check_aliases_(const Views &views) const {
+    const auto overlap = [&](size_t a, size_t b) {
+      if (!spans_[a] || !spans_[b]) return false;
+      const auto x = reinterpret_cast<uintptr_t>(views[a]->data());
+      const auto y = reinterpret_cast<uintptr_t>(views[b]->data());
+      return x <= y ? y - x < spans_[a] : x - y < spans_[b];
+    };
+    for (size_t dst : {size_t{7}, size_t{2}, size_t{8}}) {
+      if (!views[dst] || (dst == 2 && !views[6])) continue;
+      for (size_t src = 0; src < views.size(); ++src) {
+        if (src == dst || !views[src] || !overlap(dst, src)) continue;
+        const bool exact_layout =
+            views[dst]->data() == views[src]->data() &&
+            views[dst]->strides() == views[src]->strides();
+        if (exact_layout && ((dst == 7 && src == 0) || (dst == 8 && src == 2)))
+          continue;
+        throw std::invalid_argument(
+            "Hygon causal conv unsupported tensor overlap");
+      }
+    }
+  }
   static int index_kind_(const std::optional<Tensor> &t) {
     if (!t) return 0;
     return t->dtype() == DataType::kInt64 ? 2 : 1;
