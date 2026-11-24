@@ -123,13 +123,14 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
   Operator(Tensor c, const Tensor a, const Tensor as, const Tensor b,
            const Tensor bs, const std::optional<Tensor> bias)
       : I8Gemm(c, a, as, b, bs, bias) {
-    const char* enabled = std::getenv("INFINIOPS_V4_I8_PROJECTION_PREFILL_DTK");
-    if (enabled && enabled[0] == '1' && enabled[1] == '\0' && prefill_shape(c, a, bias)) {
+    if (prefill_shape(c, a, bias)) {
       prefill_workspace_bytes_ = c.numel() * sizeof(int32_t);
     }
   }
   bool capture_safe() const override { return true; }
-  size_t workspace_size_in_bytes() const override { return prefill_workspace_bytes_; }
+  size_t workspace_size_in_bytes() const override {
+    return prefill_workspace_bytes_ && prefill_enabled() ? prefill_workspace_bytes_ : 0;
+  }
   static bool supports(Tensor c, Tensor a, Tensor as, Tensor b, Tensor bs,
                        const std::optional<Tensor> bias) {
     if (a.ndim() != 2 || b.ndim() != 2 || c.ndim() != 2 || a.size(1) == 0 ||
@@ -244,6 +245,11 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
   }
 
  private:
+  static bool prefill_enabled() {
+    const char* mode = std::getenv("INFINIOPS_V4_I8_PROJECTION_PREFILL_DTK");
+    return mode && mode[0] == '1' && mode[1] == '\0';
+  }
+
   static bool prefill_shape(Tensor c, Tensor a, const std::optional<Tensor>& bias) {
     if (bias || a.ndim() != 2 || c.ndim() != 2 || c.dtype() != DataType::kBFloat16) return false;
     return c.size(0) >= 64 && c.size(0) <= 256 && a.size(1) == 1024 &&
@@ -252,7 +258,7 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
 
   bool launch_prefill(Tensor c, Tensor a, Tensor as, Tensor b, Tensor bs,
                       const std::optional<Tensor>& bias) const {
-    if (!prefill_workspace_bytes_ || !workspace_ || !prefill_shape(c, a, bias) ||
+    if (!prefill_workspace_bytes_ || !workspace_ || !prefill_enabled() || !prefill_shape(c, a, bias) ||
         workspace_size_in_bytes_ < c.numel() * sizeof(int32_t)) return false;
     const auto addresses = reinterpret_cast<uintptr_t>(workspace_) |
                            reinterpret_cast<uintptr_t>(a.data()) |
