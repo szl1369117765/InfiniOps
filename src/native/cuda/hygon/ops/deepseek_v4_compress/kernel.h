@@ -201,7 +201,9 @@ class Operator<DeepseekV4Compress, Device::Type::kHygon> : public DeepseekV4Comp
     if ((window != 8 && window != 128) || (dim != 128 && dim != 512) ||
         (window == 128 && dim != 512) || !projection.size(0) || !state.size(0) ||
         projection.size(1) != dim * (window == 8 ? 4 : 2) ||
-        state.size(1) != projection.size(1) || !sources.size(0) ||
+        state.size(1) != projection.size(1) ||
+        (!sources.size(0) && (window != 128 || projection.dtype() != DataType::kFloat32 ||
+                             projection.size(0) < 2 || projection.size(0) > 4)) ||
         (ape.shape() != Tensor::Shape{window, dim} &&
          (window != 8 || ape.shape() != Tensor::Shape{4, 2 * dim})) ||
         out.size(0) != sources.size(0) ||
@@ -235,32 +237,34 @@ class Operator<DeepseekV4Compress, Device::Type::kHygon> : public DeepseekV4Comp
     const auto launch = [&](auto tag) {
       using T = decltype(tag);
       const auto* data = static_cast<const T*>(projection.data());
-      bool use_short_c128 = false;
-      if constexpr (std::is_same_v<T, float>) {
-        if (sources.size(1) == kC128Window && out.size(1) == kC128HeadDim &&
-            projection.size(0) <= 4 && out.size(0) <= 4) {
-          const bool enabled = [] {
-            const char* value = std::getenv("INFINIOPS_V4_C128_POOL_SHORT");
-            return value && value[0] == '1' && value[1] == '\0';
-          }();
-          use_short_c128 = enabled;
-          if (use_short_c128) {
-            PoolC128Short<<<static_cast<unsigned>(out.size(0)) * kC128Tiles,
-                            kC128ChannelsPerBlock * kC128GroupWorkers, 0, stream>>>(
-                data, static_cast<const float*>(ape.data()),
-                static_cast<const int32_t*>(sources.data()), state_data,
-                static_cast<float*>(out.data()), projection.size(0), state.size(0));
+      if (out.size(0) != 0) {
+        bool use_short_c128 = false;
+        if constexpr (std::is_same_v<T, float>) {
+          if (sources.size(1) == kC128Window && out.size(1) == kC128HeadDim &&
+              projection.size(0) <= 4 && out.size(0) <= 4) {
+            const bool enabled = [] {
+              const char* value = std::getenv("INFINIOPS_V4_C128_POOL_SHORT");
+              return value && value[0] == '1' && value[1] == '\0';
+            }();
+            use_short_c128 = enabled;
+            if (use_short_c128) {
+              PoolC128Short<<<static_cast<unsigned>(out.size(0)) * kC128Tiles,
+                              kC128ChannelsPerBlock * kC128GroupWorkers, 0, stream>>>(
+                  data, static_cast<const float*>(ape.data()),
+                  static_cast<const int32_t*>(sources.data()), state_data,
+                  static_cast<float*>(out.data()), projection.size(0), state.size(0));
+            }
           }
         }
+        if (!use_short_c128) {
+          Pool<T><<<grid(out.size(0)), 128, 0, stream>>>(
+              data, static_cast<const float*>(ape.data()),
+              static_cast<const int32_t*>(sources.data()), state_data,
+              static_cast<T*>(out.data()), projection.size(0), state.size(0),
+              out.size(0), out.size(1), sources.size(1), ape.size(0) == 4);
+        }
+        if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("DeepSeek V4 pooling launch failed");
       }
-      if (!use_short_c128) {
-        Pool<T><<<grid(out.size(0)), 128, 0, stream>>>(
-            data, static_cast<const float*>(ape.data()),
-            static_cast<const int32_t*>(sources.data()), state_data,
-            static_cast<T*>(out.data()), projection.size(0), state.size(0),
-            out.size(0), out.size(1), sources.size(1), ape.size(0) == 4);
-      }
-      if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("DeepSeek V4 pooling launch failed");
       Update<T><<<grid(projection.size(0)), 128, 0, stream>>>(
           data, static_cast<const int32_t*>(slots.data()), state_data, projection.size(0),
           state.size(0), projection.size(1));
