@@ -1,6 +1,8 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 #include "base/i8_gemm.h"
@@ -42,6 +44,66 @@ __global__ void matmul(T* out, const int8_t* a, const float* as,
   }
 }
 
+static constexpr unsigned kProjectionRows = 4;
+static constexpr unsigned kProjectionColumns = 4096;
+static constexpr unsigned kProjectionK = 1024;
+static constexpr unsigned kWave = 64;
+static constexpr unsigned kWavesPerBlock = 4;
+
+static __device__ __forceinline__ int32_t LoadProjectionInt8x4(const int8_t* input) {
+  int32_t packed;
+  __builtin_memcpy(&packed, __builtin_assume_aligned(input, alignof(int32_t)), sizeof(packed));
+  return packed;
+}
+
+static __device__ __forceinline__ int32_t ProjectionDot4(int32_t lhs, int32_t rhs, int32_t sum) {
+#if defined(__AMDGCN__) && __has_builtin(__builtin_amdgcn_sdot4)
+  return __builtin_amdgcn_sdot4(lhs, rhs, sum, false);
+#else
+  uint32_t a = static_cast<uint32_t>(lhs), b = static_cast<uint32_t>(rhs);
+  for (unsigned i = 0; i < 4; ++i) {
+    sum += (static_cast<int>((a & 0xff) ^ 0x80) - 128) *
+           (static_cast<int>((b & 0xff) ^ 0x80) - 128);
+    a >>= 8;
+    b >>= 8;
+  }
+  return sum;
+#endif
+}
+
+static __global__ void matmul_q4_projection(__nv_bfloat16* out, const int8_t* a,
+                                            const float* as, const int8_t* b, const float* bs) {
+  const unsigned lane = threadIdx.x % kWave;
+  const unsigned col = blockIdx.x * kWavesPerBlock + threadIdx.x / kWave;
+  const int8_t* weight = b + col * kProjectionK;
+  int32_t dot[kProjectionRows] = {};
+  #pragma unroll
+  for (unsigned k = lane * 4; k < kProjectionK; k += kWave * 4) {
+    const int32_t packed_weight = LoadProjectionInt8x4(weight + k);
+    #pragma unroll
+    for (unsigned row = 0; row < kProjectionRows; ++row) {
+      const int32_t packed_input = LoadProjectionInt8x4(a + row * kProjectionK + k);
+      dot[row] = ProjectionDot4(packed_input, packed_weight, dot[row]);
+    }
+  }
+  #pragma unroll
+  for (unsigned offset = kWave / 2; offset; offset /= 2) {
+    #pragma unroll
+    for (unsigned row = 0; row < kProjectionRows; ++row) {
+      dot[row] += __shfl_down(dot[row], offset, kWave);
+    }
+  }
+  if (lane == 0) {
+    using Convert = Caster<Device::Type::kHygon>;
+    #pragma unroll
+    for (unsigned row = 0; row < kProjectionRows; ++row) {
+      const float scale = __fmul_rn(as[row], bs[col]);
+      const float value = __fmul_rn(static_cast<float>(dot[row]), scale);
+      out[row * kProjectionColumns + col] = Convert::template Cast<__nv_bfloat16>(value);
+    }
+  }
+}
+
 }  // namespace hygon_i8_gemm
 
 template <>
@@ -77,6 +139,26 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
     if (!c.numel()) return;
     auto launch = [&](auto tag) {
       using T = decltype(tag);
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        using namespace hygon_i8_gemm;
+        if (!bias && c.size(0) == kProjectionRows && c.size(1) == kProjectionColumns &&
+            a.size(1) == kProjectionK &&
+            reinterpret_cast<std::uintptr_t>(a.data()) % alignof(int32_t) == 0 &&
+            reinterpret_cast<std::uintptr_t>(b.data()) % alignof(int32_t) == 0) {
+          const bool enabled = [] {
+            const char* value = std::getenv("INFINIOPS_V4_I8_PROJECTION_Q4");
+            return value && value[0] == '1' && value[1] == '\0';
+          }();
+          if (enabled) {
+            matmul_q4_projection<<<kProjectionColumns / kWavesPerBlock, kWave * kWavesPerBlock,
+                                   0, static_cast<cudaStream_t>(stream_)>>>(
+                static_cast<T*>(c.data()), static_cast<const int8_t*>(a.data()),
+                static_cast<const float*>(as.data()), static_cast<const int8_t*>(b.data()),
+                static_cast<const float*>(bs.data()));
+            return;
+          }
+        }
+      }
       if (a.size(0) == 1 && (a.size(1) == 1024 || a.size(1) == 4096) &&
           c.size(1) <= INT32_MAX - 8 &&
           (reinterpret_cast<uintptr_t>(a.data()) & 3u) == 0 &&
