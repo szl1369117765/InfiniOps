@@ -10,6 +10,8 @@ namespace infini::ops {
 // C4 APE can be the prepared [8, dim] or raw checkpoint [4, 2 * dim].
 // An all-padding output row is zero. state_slots uses unique nonnegative
 // destinations, or -1. Pooling observes the state from before the launch.
+// Hygon FP32 C128 accepts sources [0,128] and out [0,512] for a 2–4 row
+// projection to update state without pooling.
 class DeepseekV4Compress : public Operator<DeepseekV4Compress> {
  public:
   DeepseekV4Compress(const Tensor projection, const Tensor ape, const Tensor sources,

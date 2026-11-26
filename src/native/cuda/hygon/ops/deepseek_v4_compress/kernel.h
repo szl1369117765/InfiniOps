@@ -3,6 +3,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 #include "base/deepseek_v4_compress.h"
 #include "native/cuda/hygon/caster.cuh"
@@ -108,6 +109,67 @@ static __global__ void Pool(const T* projection, const float* ape,
   }
 }
 
+// Keep the reference eight-token reductions and the final merge in their
+// original order. Split only independent groups and channel tiles.
+static constexpr unsigned kC128ChannelsPerBlock = 32;
+static constexpr unsigned kC128GroupWorkers = 8;
+static constexpr unsigned kC128Groups = 16;
+static constexpr unsigned kC128HeadDim = 512;
+static constexpr unsigned kC128Window = 128;
+static constexpr unsigned kC128Tiles = kC128HeadDim / kC128ChannelsPerBlock;
+
+static __global__ void PoolC128Short(const float* projection, const float* ape,
+                                    const int32_t* sources, const float* state, float* out,
+                                    size_t input_rows, size_t state_rows) {
+  __shared__ float maxima[kC128Groups][kC128ChannelsPerBlock];
+  __shared__ float sums[kC128Groups][kC128ChannelsPerBlock];
+  __shared__ float products[kC128Groups][kC128ChannelsPerBlock];
+
+  const size_t row = blockIdx.x / kC128Tiles;
+  const unsigned channel_lane = threadIdx.x % kC128ChannelsPerBlock;
+  const unsigned group_lane = threadIdx.x / kC128ChannelsPerBlock;
+  const size_t channel = (blockIdx.x % kC128Tiles) * kC128ChannelsPerBlock + channel_lane;
+  for (unsigned group = group_lane; group < kC128Groups; group += kC128GroupWorkers) {
+    float values[8], scores[8], maximum = -INFINITY;
+    for (unsigned i = 0; i < 8; ++i) {
+      const size_t position = group * 8 + i;
+      ReadSource(projection, state, ape, sources[row * kC128Window + position],
+                 input_rows, state_rows, kC128HeadDim, 2 * kC128HeadDim,
+                 position, channel, false, false, values[i], scores[i]);
+      maximum = fmaxf(maximum, scores[i]);
+    }
+    float sum = 0.0f, product = 0.0f;
+    if (maximum != -INFINITY) {
+      for (unsigned i = 0; i < 8; ++i) {
+        if (scores[i] == -INFINITY) continue;
+        const float weight = FastExp(scores[i] - maximum);
+        product = fmaf(values[i], weight, product);
+        sum += weight;
+      }
+    }
+    maxima[group][channel_lane] = maximum;
+    sums[group][channel_lane] = sum;
+    products[group][channel_lane] = product;
+  }
+  __syncthreads();
+
+  if (group_lane != 0) return;
+  float maximum = -INFINITY;
+  for (unsigned group = 0; group < kC128Groups; ++group)
+    maximum = fmaxf(maximum, maxima[group][channel_lane]);
+  float total = 0.0f, sum = 0.0f;
+  if (maximum != -INFINITY) {
+    for (unsigned group = 0; group < kC128Groups; ++group) {
+      const float group_max = maxima[group][channel_lane];
+      if (group_max == -INFINITY) continue;
+      const float weight = FastExp(group_max - maximum);
+      total = fmaf(products[group][channel_lane], weight, total);
+      sum = fmaf(sums[group][channel_lane], weight, sum);
+    }
+  }
+  out[row * kC128HeadDim + channel] = sum == 0.0f ? 0.0f : total / sum;
+}
+
 template<class T>
 static __global__ void Update(const T* projection, const int32_t* slots, float* state,
                               size_t input_rows, size_t state_rows, size_t width) {
@@ -139,7 +201,9 @@ class Operator<DeepseekV4Compress, Device::Type::kHygon> : public DeepseekV4Comp
     if ((window != 8 && window != 128) || (dim != 128 && dim != 512) ||
         (window == 128 && dim != 512) || !projection.size(0) || !state.size(0) ||
         projection.size(1) != dim * (window == 8 ? 4 : 2) ||
-        state.size(1) != projection.size(1) || !sources.size(0) ||
+        state.size(1) != projection.size(1) ||
+        (!sources.size(0) && (window != 128 || projection.dtype() != DataType::kFloat32 ||
+                             projection.size(0) < 2 || projection.size(0) > 4)) ||
         (ape.shape() != Tensor::Shape{window, dim} &&
          (window != 8 || ape.shape() != Tensor::Shape{4, 2 * dim})) ||
         out.size(0) != sources.size(0) ||
@@ -173,12 +237,34 @@ class Operator<DeepseekV4Compress, Device::Type::kHygon> : public DeepseekV4Comp
     const auto launch = [&](auto tag) {
       using T = decltype(tag);
       const auto* data = static_cast<const T*>(projection.data());
-      Pool<T><<<grid(out.size(0)), 128, 0, stream>>>(
-          data, static_cast<const float*>(ape.data()),
-          static_cast<const int32_t*>(sources.data()), state_data,
-          static_cast<T*>(out.data()), projection.size(0), state.size(0),
-          out.size(0), out.size(1), sources.size(1), ape.size(0) == 4);
-      if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("DeepSeek V4 pooling launch failed");
+      if (out.size(0) != 0) {
+        bool use_short_c128 = false;
+        if constexpr (std::is_same_v<T, float>) {
+          if (sources.size(1) == kC128Window && out.size(1) == kC128HeadDim &&
+              projection.size(0) <= 4 && out.size(0) <= 4) {
+            const bool enabled = [] {
+              const char* value = std::getenv("INFINIOPS_V4_C128_POOL_SHORT");
+              return value && value[0] == '1' && value[1] == '\0';
+            }();
+            use_short_c128 = enabled;
+            if (use_short_c128) {
+              PoolC128Short<<<static_cast<unsigned>(out.size(0)) * kC128Tiles,
+                              kC128ChannelsPerBlock * kC128GroupWorkers, 0, stream>>>(
+                  data, static_cast<const float*>(ape.data()),
+                  static_cast<const int32_t*>(sources.data()), state_data,
+                  static_cast<float*>(out.data()), projection.size(0), state.size(0));
+            }
+          }
+        }
+        if (!use_short_c128) {
+          Pool<T><<<grid(out.size(0)), 128, 0, stream>>>(
+              data, static_cast<const float*>(ape.data()),
+              static_cast<const int32_t*>(sources.data()), state_data,
+              static_cast<T*>(out.data()), projection.size(0), state.size(0),
+              out.size(0), out.size(1), sources.size(1), ape.size(0) == 4);
+        }
+        if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("DeepSeek V4 pooling launch failed");
+      }
       Update<T><<<grid(projection.size(0)), 128, 0, stream>>>(
           data, static_cast<const int32_t*>(slots.data()), state_data, projection.size(0),
           state.size(0), projection.size(1));
