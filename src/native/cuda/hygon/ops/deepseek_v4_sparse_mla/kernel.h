@@ -50,7 +50,7 @@ inline hygon_flash_mla::Pages vendor_pages(const Pages& p) {
 }
 
 inline hygon_flash_mla::Arguments vendor_arguments(
-    const Tensor& q, const Tensor& sink, const Tensor& out, const Pages& first, const Pages& second,
+    const Tensor& q, const Tensor& sink, Tensor& out, const Pages& first, const Pages& second,
     void* workspace, size_t workspace_size, void* stream, int partitions, double scale) {
   return {q.data(), static_cast<const float*>(sink.data()), out.data(), workspace, workspace_size, stream,
           static_cast<int>(q.size(0)), static_cast<int>(q.size(1)), partitions, static_cast<float>(scale),
