@@ -9,6 +9,7 @@ constexpr unsigned kGroupWave = 64;
 constexpr unsigned kGroupWaves = 4;
 constexpr unsigned kGroupHidden = 4096;
 constexpr unsigned kGroupInner = 256;
+constexpr unsigned kM12GroupTokens = 3 * kGroupTokens;
 
 template <class T>
 static __device__ float FinishGateUp(int32_t gate, int32_t up, float token_scale,
@@ -176,6 +177,57 @@ __global__ void SharedDownQ4(const int8_t* activated, const float* activation_sc
     }
     if (lane == 0) out[token * kGroupHidden + channel] = Convert::template Cast<T>(output * 1.0f);
   }
+}
+
+template <class T, unsigned TopK>
+static cudaError_t LaunchGroupedGateUp(
+    const int8_t* input, const float* input_scale, const int64_t* ids,
+    const int8_t* weights, const float* scales, float* activated,
+    Q4ExpertGroup* groups, size_t tokens, size_t experts, float limit,
+    cudaStream_t stream) {
+  constexpr auto tile_routes = kGroupTokens * TopK;
+  constexpr auto block = kGroupWave * kGroupWaves;
+  for (size_t row = 0; row < tokens; row += kGroupTokens) {
+    const auto slot = row * TopK;
+    auto* tile_activation = activated + slot * kGroupInner;
+    auto* tile_groups = groups + slot;
+    BuildQ4ExpertGroups<TopK><<<1, kGroupWave, 0, stream>>>(
+        ids + slot, experts, tile_activation, tile_groups);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    GateUpQ4<T, TopK><<<tile_routes * kGroupInner / kGroupWaves, block, 0, stream>>>(
+        input + row * kGroupHidden, input_scale + row, tile_groups,
+        weights, scales, tile_activation, limit);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+  }
+  return cudaSuccess;
+}
+
+template <class T, unsigned TopK>
+static cudaError_t LaunchGroupedDown(
+    const int8_t* activated, const float* activation_scale, const int64_t* ids,
+    const float* route_weights, const int8_t* weights, const float* scales,
+    T* out, const Q4ExpertGroup* groups, size_t tokens, size_t experts,
+    float routed_scale, cudaStream_t stream) {
+  constexpr auto block = kGroupWave * kGroupWaves;
+  for (size_t row = 0; row < tokens; row += kGroupTokens) {
+    const auto slot = row * TopK;
+    const auto* tile_activation = activated + slot * kGroupInner;
+    auto* tile_out = out + row * kGroupHidden;
+    if constexpr (TopK == 1) {
+      SharedDownQ4<T><<<kGroupHidden / kGroupWaves, block, 0, stream>>>(
+          tile_activation, activation_scale + slot, ids + slot,
+          route_weights + slot, weights, scales, tile_out);
+    } else {
+      RoutedDownQ4<T><<<kGroupHidden, block, 0, stream>>>(
+          tile_activation, activation_scale + slot, ids + slot, groups + slot,
+          route_weights + slot, weights, scales, tile_out, experts, routed_scale);
+    }
+    const auto status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+  }
+  return cudaSuccess;
 }
 
 }  // namespace infini::ops::deepseek_v4_w8a8_detail

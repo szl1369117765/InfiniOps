@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -278,10 +279,16 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
            inner == kDtkSharedInner && rows > 16 && rows <= 256;
   }
 
-  static bool q4_group_shape(const Tensor& x, const Tensor& weights, size_t inner,
-                             size_t experts, bool routed) {
+  static bool flag_enabled(const char* name) {
+    const char* mode = std::getenv(name);
+    return mode && mode[0] == '1' && mode[1] == '\0';
+  }
+
+  static bool group_shape(const Tensor& x, const Tensor& weights, size_t inner,
+                          size_t experts, bool routed) {
     using namespace deepseek_v4_w8a8_detail;
-    return x.dtype() == DataType::kBFloat16 && x.size(0) == kGroupTokens &&
+    return x.dtype() == DataType::kBFloat16 &&
+           (x.size(0) == kGroupTokens || x.size(0) == kM12GroupTokens) &&
            x.size(1) == kGroupHidden && inner == kGroupInner &&
            ((routed && weights.size(1) == kGroupTopK && experts == 256) ||
             (!routed && weights.size(1) == 1 && experts == 1));
@@ -293,7 +300,8 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
     const size_t tokens = x.size(0), routes = weights.numel();
     const size_t bytes = (routes * inner + tokens + routes) * sizeof(float) +
                          tokens * x.size(1) + routes * inner;
-    return bytes + (q4_group_shape(x, weights, inner, experts, routed)
+    // Reserve groups by shape so the same operator can switch modes safely.
+    return bytes + (group_shape(x, weights, inner, experts, routed)
                         ? routes * sizeof(Q4ExpertGroup) : 0);
   }
 
@@ -322,11 +330,11 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
                         reinterpret_cast<uintptr_t>(gate_up.data()) % 4 == 0 &&
                         reinterpret_cast<uintptr_t>(down.data()) % 4 == 0;
     const bool routed = routed_scale.has_value();
-    const auto* mode = std::getenv("INFINI_HYGON_MOE_Q4_GROUP");
-    const bool grouped = packed && mode && mode[0] == '1' && mode[1] == '\0' &&
-                         q4_group_shape(x, weights, inner, down.size(0), routed);
+    const bool m12 = tokens == kM12GroupTokens;
+    const bool grouped = packed && group_shape(x, weights, inner, down.size(0), routed) &&
+                         flag_enabled(m12 ? "INFINI_HYGON_MOE_M12_GROUP"
+                                          : "INFINI_HYGON_MOE_Q4_GROUP");
     auto* groups = grouped ? reinterpret_cast<Q4ExpertGroup*>(q_activated + routes * inner) : nullptr;
-    constexpr auto wave_block = kGroupWave * kGroupWaves;
     cublasHandle_t dtk_handle = nullptr;
     int32_t* dtk_dots = nullptr;
     if (packed && dtk_workspace_bytes_ && workspace_size_in_bytes_ >= dtk_workspace_bytes_ &&
@@ -357,20 +365,13 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
       SharedDtkGateEpilogue<T><<<dtk_grid(kDtkSharedInner), kDtkEpilogueThreads, 0, stream>>>(
           dtk_dots, input_scale, ids, static_cast<const float*>(gate_up_scale.data()),
           activated, tokens, static_cast<float>(limit));
-    } else if (grouped && routed) {
-      BuildQ4ExpertGroups<kGroupTopK><<<1, kGroupWave, 0, stream>>>(ids, down.size(0), activated, groups);
-      if (cudaGetLastError() != cudaSuccess)
-        throw std::runtime_error("DeepSeek V4 Q4 expert grouping failed");
-      GateUpQ4<T, kGroupTopK><<<routes * kGroupInner / kGroupWaves, wave_block, 0, stream>>>(
-          q_input, input_scale, groups, static_cast<const int8_t*>(gate_up.data()),
-          static_cast<const float*>(gate_up_scale.data()), activated, static_cast<float>(limit));
     } else if (grouped) {
-      BuildQ4ExpertGroups<1><<<1, kGroupWave, 0, stream>>>(ids, down.size(0), activated, groups);
-      if (cudaGetLastError() != cudaSuccess)
-        throw std::runtime_error("DeepSeek V4 Q4 expert grouping failed");
-      GateUpQ4<T, 1><<<routes * kGroupInner / kGroupWaves, wave_block, 0, stream>>>(
-          q_input, input_scale, groups, static_cast<const int8_t*>(gate_up.data()),
-          static_cast<const float*>(gate_up_scale.data()), activated, static_cast<float>(limit));
+      const auto launch_gate = routed ? LaunchGroupedGateUp<T, kGroupTopK>
+                                      : LaunchGroupedGateUp<T, 1>;
+      if (launch_gate(q_input, input_scale, ids, static_cast<const int8_t*>(gate_up.data()),
+                      static_cast<const float*>(gate_up_scale.data()), activated, groups,
+                      tokens, down.size(0), static_cast<float>(limit), stream) != cudaSuccess)
+        throw std::runtime_error("DeepSeek V4 grouped expert gate/up launch failed");
     } else if (packed) {
       expert_wave::Gate<T><<<grid((routes * inner + 3) / 4), 256, 0, stream>>>(
           q_input, input_scale, ids, static_cast<const int8_t*>(gate_up.data()),
@@ -402,16 +403,17 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
       SharedDtkDownEpilogue<T><<<dtk_grid(kDtkSharedHidden), kDtkEpilogueThreads, 0, stream>>>(
           dtk_dots, activation_scale, ids, static_cast<const float*>(weights.data()),
           static_cast<const float*>(down_scale.data()), static_cast<T*>(out.data()), tokens);
-    } else if (grouped && routed) {
-      RoutedDownQ4<T><<<kGroupHidden, wave_block, 0, stream>>>(
-          q_activated, activation_scale, ids, groups, static_cast<const float*>(weights.data()),
-          static_cast<const int8_t*>(down.data()), static_cast<const float*>(down_scale.data()),
-          static_cast<T*>(out.data()), down.size(0), static_cast<float>(*routed_scale));
     } else if (grouped) {
-      SharedDownQ4<T><<<kGroupHidden / kGroupWaves, wave_block, 0, stream>>>(
-          q_activated, activation_scale, ids, static_cast<const float*>(weights.data()),
-          static_cast<const int8_t*>(down.data()), static_cast<const float*>(down_scale.data()),
-          static_cast<T*>(out.data()));
+      const auto launch_down = routed ? LaunchGroupedDown<T, kGroupTopK>
+                                      : LaunchGroupedDown<T, 1>;
+      if (launch_down(q_activated, activation_scale, ids, static_cast<const float*>(weights.data()),
+                      static_cast<const int8_t*>(down.data()), static_cast<const float*>(down_scale.data()),
+                      static_cast<T*>(out.data()), groups, tokens, down.size(0),
+                      static_cast<float>(routed_scale.value_or(1.0)), stream) != cudaSuccess)
+        throw std::runtime_error("DeepSeek V4 grouped expert down launch failed");
+      if (m12 && flag_enabled("INFINI_HYGON_MOE_M12_GROUP_TRACE"))
+        std::fprintf(stderr, "MTP_M12_MOE_GROUP %s %zu device=%d\n",
+                     routed ? "routed" : "shared", tokens, static_cast<int>(x.device().index()));
     } else if (packed) {
       expert_wave::Down<T><<<grid((out.numel() + 3) / 4), 256, 0, stream>>>(
           q_activated, activation_scale, ids,
