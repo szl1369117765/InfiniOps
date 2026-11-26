@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <type_traits>
 
@@ -56,6 +57,8 @@ static __global__ void prefill_projection_epilogue(__nv_bfloat16* out, const int
 }
 
 static constexpr unsigned kProjectionRows = 4;
+static constexpr unsigned kProjectionM12Tiles = 3;
+static constexpr unsigned kProjectionM12Rows = kProjectionRows * kProjectionM12Tiles;
 static constexpr unsigned kProjectionColumns = 4096;
 static constexpr unsigned kProjectionK = 1024;
 static constexpr unsigned kWave = 64;
@@ -82,8 +85,8 @@ static __device__ __forceinline__ int32_t ProjectionDot4(int32_t lhs, int32_t rh
 #endif
 }
 
-static __global__ void matmul_q4_projection(__nv_bfloat16* out, const int8_t* a,
-                                            const float* as, const int8_t* b, const float* bs) {
+static __device__ __forceinline__ void ProjectionQ4Tile(
+    __nv_bfloat16* out, const int8_t* a, const float* as, const int8_t* b, const float* bs) {
   const unsigned lane = threadIdx.x % kWave;
   const unsigned col = blockIdx.x * kWavesPerBlock + threadIdx.x / kWave;
   const int8_t* weight = b + col * kProjectionK;
@@ -113,6 +116,17 @@ static __global__ void matmul_q4_projection(__nv_bfloat16* out, const int8_t* a,
       out[row * kProjectionColumns + col] = Convert::template Cast<__nv_bfloat16>(value);
     }
   }
+}
+
+static __global__ void matmul_q4_projection(__nv_bfloat16* out, const int8_t* a,
+                                            const float* as, const int8_t* b, const float* bs) {
+  ProjectionQ4Tile(out, a, as, b, bs);
+}
+
+static __global__ void matmul_m12_projection(__nv_bfloat16* out, const int8_t* a,
+                                             const float* as, const int8_t* b, const float* bs) {
+  const size_t row = size_t(blockIdx.y) * kProjectionRows;
+  ProjectionQ4Tile(out + row * kProjectionColumns, a + row * kProjectionK, as + row, b, bs);
 }
 
 }  // namespace hygon_i8_gemm
@@ -157,20 +171,31 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
     if (!supports(c, a, as, b, bs, bias))
       throw std::invalid_argument("Unsupported Hygon INT8 GEMM");
     if (!c.numel()) return;
+    bool used_m12_projection = false;
     auto launch = [&](auto tag) {
       using T = decltype(tag);
       if constexpr (std::is_same_v<T, __nv_bfloat16>) {
         using namespace hygon_i8_gemm;
         if (launch_prefill(c, a, as, b, bs, bias)) return;
-        if (!bias && c.size(0) == kProjectionRows && c.size(1) == kProjectionColumns &&
+        const bool m12 = c.size(0) == kProjectionM12Rows;
+        if (!bias && (c.size(0) == kProjectionRows || m12) && c.size(1) == kProjectionColumns &&
             a.size(1) == kProjectionK &&
             reinterpret_cast<std::uintptr_t>(a.data()) % alignof(int32_t) == 0 &&
             reinterpret_cast<std::uintptr_t>(b.data()) % alignof(int32_t) == 0) {
-          const bool enabled = [] {
-            const char* value = std::getenv("INFINIOPS_V4_I8_PROJECTION_Q4");
-            return value && value[0] == '1' && value[1] == '\0';
-          }();
+          const char* value = std::getenv(m12 ? "INFINIOPS_V4_I8_PROJECTION_M12"
+                                            : "INFINIOPS_V4_I8_PROJECTION_Q4");
+          const bool enabled = value && value[0] == '1' && value[1] == '\0';
           if (enabled) {
+            if (m12) {
+              const dim3 grid(kProjectionColumns / kWavesPerBlock, kProjectionM12Tiles);
+              matmul_m12_projection<<<grid, kWave * kWavesPerBlock, 0,
+                                      static_cast<cudaStream_t>(stream_)>>>(
+                  static_cast<T*>(c.data()), static_cast<const int8_t*>(a.data()),
+                  static_cast<const float*>(as.data()), static_cast<const int8_t*>(b.data()),
+                  static_cast<const float*>(bs.data()));
+              used_m12_projection = true;
+              return;
+            }
             matmul_q4_projection<<<kProjectionColumns / kWavesPerBlock, kWave * kWavesPerBlock,
                                    0, static_cast<cudaStream_t>(stream_)>>>(
                 static_cast<T*>(c.data()), static_cast<const int8_t*>(a.data()),
@@ -242,6 +267,12 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
       launch(__nv_bfloat16{});
     if (cudaGetLastError() != cudaSuccess)
       throw std::runtime_error("Hygon INT8 GEMM launch failed");
+    if (used_m12_projection) {
+      const char* trace = std::getenv("INFINIOPS_V4_I8_PROJECTION_M12_TRACE");
+      if (trace && trace[0] == '1' && trace[1] == '\0')
+        std::fprintf(stderr, "MTP_M12_I8_PROJECTION 12 4096 1024 device=%d\n",
+                     static_cast<int>(c.device().index()));
+    }
   }
 
  private:
