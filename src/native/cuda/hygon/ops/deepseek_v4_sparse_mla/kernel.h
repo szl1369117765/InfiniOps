@@ -28,6 +28,33 @@ struct Pages {
   size_t index_width{};
 };
 
+inline int device_partitions(const Tensor& query) {
+  int partitions{};
+  if (cudaDeviceGetAttribute(&partitions, cudaDevAttrMultiProcessorCount, query.device().index()) != cudaSuccess)
+    throw std::runtime_error("DeepSeek V4 sparse MLA device query failed");
+  return partitions;
+}
+
+inline Pages pages_for(const Tensor& p, const Tensor& ids, const Tensor& lens, size_t tokens) {
+  return {static_cast<const uint8_t*>(p.data()), static_cast<const int32_t*>(ids.data()),
+          static_cast<const int32_t*>(lens.data()), p.size(0), p.size(1), tokens, ids.size(1)};
+}
+
+#ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
+inline hygon_flash_mla::Pages vendor_pages(const Pages& p) {
+  return {p.data, p.indices, p.lengths, static_cast<int>(p.page_count),
+          static_cast<int>(p.page_tokens), static_cast<int>(p.page_stride), static_cast<int>(p.index_width)};
+}
+
+inline hygon_flash_mla::Arguments vendor_arguments(
+    const Tensor& q, const Tensor& sink, const Tensor& out, const Pages& first, const Pages& second,
+    void* workspace, size_t workspace_size, void* stream, int partitions, double scale) {
+  return {q.data(), static_cast<const float*>(sink.data()), out.data(), workspace, workspace_size, stream,
+          static_cast<int>(q.size(0)), static_cast<int>(q.size(1)), partitions, static_cast<float>(scale),
+          vendor_pages(first), vendor_pages(second)};
+}
+#endif
+
 // E4M3 finite-only encoding used by DeepSeek V4's packed cache.
 static __device__ float decode_fp8(uint8_t byte) {
   const int exponent = (byte >> 3) & 15;
@@ -264,8 +291,7 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
       : DeepseekV4SparseMla(q, swa, indices, lengths, sink, extra, extra_indices, extra_lengths, extra_page_size, scale, out) {
     if (!supports(q, swa, indices, lengths, sink, extra, extra_indices, extra_lengths, extra_page_size, scale, out))
       throw std::invalid_argument("DeepSeek V4 sparse MLA inputs are unsupported");
-    if (cudaDeviceGetAttribute(&parallel_queries_, cudaDevAttrMultiProcessorCount, q.device().index()) != cudaSuccess)
-      throw std::runtime_error("DeepSeek V4 sparse MLA device query failed");
+    parallel_queries_ = v4_sparse_mla_detail::device_partitions(q);
 #ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
     vendor_ = q.dtype()==DataType::kBFloat16 && q.size(1)<=64 && q.size(0)<=3072;
     if (vendor_) workspace_bytes_=hygon_flash_mla::workspace_bytes(q.size(0),parallel_queries_);
@@ -282,25 +308,14 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
     using namespace v4_sparse_mla_detail;
     if (!supports(q, swa, indices, lengths, sink, extra, extra_indices, extra_lengths, extra_page_size, scale, out))
       throw std::invalid_argument("DeepSeek V4 sparse MLA inputs changed");
-    const auto page = [](const Tensor& p, const Tensor& ids, const Tensor& lens, size_t tokens) {
-      return Pages{static_cast<const uint8_t*>(p.data()), static_cast<const int32_t*>(ids.data()),
-                   static_cast<const int32_t*>(lens.data()), p.size(0), p.size(1), tokens, ids.size(1)};
-    };
-    const auto first = page(swa, indices, lengths, 256);
-    const auto second = extra ? page(*extra, *extra_indices, *extra_lengths, extra_page_size) : Pages{};
+    const auto first = pages_for(swa, indices, lengths, 256);
+    const auto second = extra ? pages_for(*extra, *extra_indices, *extra_lengths, extra_page_size) : Pages{};
 #ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
     if (vendor_) {
       if(!workspace_ || workspace_size_in_bytes_<workspace_bytes_)
         throw std::invalid_argument("DeepSeek V4 FlashMLA workspace changed");
-      const auto convert=[](const Pages& p) {
-        return hygon_flash_mla::Pages{p.data,p.indices,p.lengths,
-          static_cast<int>(p.page_count),static_cast<int>(p.page_tokens),
-          static_cast<int>(p.page_stride),static_cast<int>(p.index_width)};
-      };
-      hygon_flash_mla::run({q.data(),static_cast<const float*>(sink.data()),out.data(),
-          workspace_,workspace_size_in_bytes_,stream_,static_cast<int>(q.size(0)),
-          static_cast<int>(q.size(1)),parallel_queries_,static_cast<float>(scale),
-          convert(first),convert(second)});
+      hygon_flash_mla::run(vendor_arguments(q, sink, out, first, second, workspace_,
+                                           workspace_size_in_bytes_, stream_, parallel_queries_, scale));
       return;
     }
 #endif
