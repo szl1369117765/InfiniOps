@@ -12,6 +12,7 @@
 #include "kernel_v2.cuh"
 #include "math.cuh"
 #include "q4_group.cuh"
+#include "native/cuda/hygon/dtk_i8_blas.h"
 #include "native/cuda/hygon/dynamic_int8_quant.cuh"
 
 namespace infini::ops {
@@ -132,6 +133,37 @@ __global__ void Down(const int8_t* activated, const float* activation_scale,
   }
 }
 
+// Wide shared experts have one route per row and a single local expert.
+static constexpr int kDtkSharedHidden = 4096;
+static constexpr int kDtkSharedInner = 256;
+static constexpr unsigned kDtkEpilogueThreads = 256;
+
+template <typename T>
+static __global__ void SharedDtkGateEpilogue(const int32_t* dots, const float* input_scale,
+                                             const int64_t* ids, const float* scales, float* activated,
+                                             size_t rows, float limit) {
+  const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= rows * kDtkSharedInner) return;
+  const size_t row = index / kDtkSharedInner, col = index % kDtkSharedInner;
+  const auto* row_dots = dots + row * (2 * kDtkSharedInner);
+  activated[index] = ids[row] == 0 ?
+      FinishGateUp<T>(row_dots[col], row_dots[kDtkSharedInner + col], input_scale[row],
+                      scales[col], scales[kDtkSharedInner + col], limit, false, true) : 0.0f;
+}
+
+template <typename T>
+static __global__ void SharedDtkDownEpilogue(const int32_t* dots, const float* activation_scale,
+                                             const int64_t* ids, const float* weights,
+                                             const float* scales, T* out, size_t rows) {
+  const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= rows * kDtkSharedHidden) return;
+  const size_t row = index / kDtkSharedHidden, col = index % kDtkSharedHidden;
+  float output = 0.0f;
+  if (ids[row] == 0)
+    output += ScaledDot(dots[index], activation_scale[row], scales[col], true) * weights[row];
+  out[index] = Caster<Device::Type::kHygon>::template Cast<T>(output * 1.0f);
+}
+
 }  // namespace deepseek_v4_w8a8_detail
 
 template <>
@@ -190,10 +222,16 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
       throw std::invalid_argument(
           "DeepSeek V4 W8A8 expert input is unsupported");
     workspace_bytes_ = workspace_bytes(x, weights, down.size(2), down.size(0), routed_scale.has_value());
+    if (shared_dtk_shape(x, weights, down.size(2), down.size(0), routed_scale.has_value())) {
+      constexpr size_t alignment = 256;
+      dtk_scratch_offset_ = (workspace_bytes_ + alignment - 1) & ~(alignment - 1);
+      dtk_workspace_bytes_ = dtk_scratch_offset_ + x.size(0) *
+          deepseek_v4_w8a8_detail::kDtkSharedHidden * sizeof(int32_t);
+    }
   }
 
   std::size_t workspace_size_in_bytes() const override {
-    return workspace_bytes_;
+    return dtk_workspace_bytes_ && shared_dtk_enabled() ? dtk_workspace_bytes_ : workspace_bytes_;
   }
   bool capture_safe() const override { return true; }
 
@@ -222,6 +260,23 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
   static constexpr size_t kMaxDotWidth =
       std::numeric_limits<int32_t>::max() / (127 * 128);
   size_t workspace_bytes_{};
+
+  size_t dtk_scratch_offset_{};
+  size_t dtk_workspace_bytes_{};
+
+  static bool shared_dtk_enabled() {
+    const char* mode = std::getenv("INFINIOPS_V4_SHARED_PREFILL_DTK");
+    return mode && mode[0] == '1' && mode[1] == '\0';
+  }
+
+  static bool shared_dtk_shape(const Tensor& x, const Tensor& weights, size_t inner,
+                               size_t experts, bool routed) {
+    using namespace deepseek_v4_w8a8_detail;
+    const size_t rows = x.size(0);
+    return !routed && experts == 1 && weights.size(1) == 1 &&
+           x.dtype() == DataType::kBFloat16 && x.size(1) == kDtkSharedHidden &&
+           inner == kDtkSharedInner && rows > 16 && rows <= 256;
+  }
 
   static bool q4_group_shape(const Tensor& x, const Tensor& weights, size_t inner,
                              size_t experts, bool routed) {
@@ -272,6 +327,19 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
                          q4_group_shape(x, weights, inner, down.size(0), routed);
     auto* groups = grouped ? reinterpret_cast<Q4ExpertGroup*>(q_activated + routes * inner) : nullptr;
     constexpr auto wave_block = kGroupWave * kGroupWaves;
+    cublasHandle_t dtk_handle = nullptr;
+    int32_t* dtk_dots = nullptr;
+    if (packed && dtk_workspace_bytes_ && workspace_size_in_bytes_ >= dtk_workspace_bytes_ &&
+        shared_dtk_shape(x, weights, inner, down.size(0), routed) && shared_dtk_enabled()) {
+      auto* scratch = static_cast<char*>(workspace_) + dtk_scratch_offset_;
+      if (reinterpret_cast<uintptr_t>(scratch) % alignof(int32_t) == 0) {
+        dtk_handle = dtk_i8_blas::Acquire(x.device().index(), stream);
+        dtk_dots = reinterpret_cast<int32_t*>(scratch);
+      }
+    }
+    const auto dtk_grid = [tokens](size_t width) {
+      return static_cast<unsigned>((tokens * width + kDtkEpilogueThreads - 1) / kDtkEpilogueThreads);
+    };
     if (packed) {
       expert_wave::Quant<T><<<grid(tokens), 256, 0, stream>>>(
           static_cast<const T*>(x.data()), q_input, input_scale, tokens,
@@ -283,7 +351,13 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
     }
     if (cudaGetLastError() != cudaSuccess)
       throw std::runtime_error("DeepSeek V4 input quantization launch failed");
-    if (grouped && routed) {
+    if (dtk_handle && dtk_i8_blas::Dot(
+          dtk_handle, dtk_dots, q_input, static_cast<const int8_t*>(gate_up.data()),
+          static_cast<int>(tokens), 2 * kDtkSharedInner, kDtkSharedHidden) == CUBLAS_STATUS_SUCCESS) {
+      SharedDtkGateEpilogue<T><<<dtk_grid(kDtkSharedInner), kDtkEpilogueThreads, 0, stream>>>(
+          dtk_dots, input_scale, ids, static_cast<const float*>(gate_up_scale.data()),
+          activated, tokens, static_cast<float>(limit));
+    } else if (grouped && routed) {
       BuildQ4ExpertGroups<kGroupTopK><<<1, kGroupWave, 0, stream>>>(ids, down.size(0), activated, groups);
       if (cudaGetLastError() != cudaSuccess)
         throw std::runtime_error("DeepSeek V4 Q4 expert grouping failed");
@@ -322,7 +396,13 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
     if (cudaGetLastError() != cudaSuccess)
       throw std::runtime_error(
           "DeepSeek V4 activation quantization launch failed");
-    if (grouped && routed) {
+    if (dtk_handle && dtk_i8_blas::Dot(
+          dtk_handle, dtk_dots, q_activated, static_cast<const int8_t*>(down.data()),
+          static_cast<int>(tokens), kDtkSharedHidden, kDtkSharedInner) == CUBLAS_STATUS_SUCCESS) {
+      SharedDtkDownEpilogue<T><<<dtk_grid(kDtkSharedHidden), kDtkEpilogueThreads, 0, stream>>>(
+          dtk_dots, activation_scale, ids, static_cast<const float*>(weights.data()),
+          static_cast<const float*>(down_scale.data()), static_cast<T*>(out.data()), tokens);
+    } else if (grouped && routed) {
       RoutedDownQ4<T><<<kGroupHidden, wave_block, 0, stream>>>(
           q_activated, activation_scale, ids, groups, static_cast<const float*>(weights.data()),
           static_cast<const int8_t*>(down.data()), static_cast<const float*>(down_scale.data()),

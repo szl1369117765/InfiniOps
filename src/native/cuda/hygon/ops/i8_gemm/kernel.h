@@ -8,6 +8,7 @@
 #include "base/i8_gemm.h"
 #include "gemv_wave64.cuh"
 #include "native/cuda/hygon/caster.cuh"
+#include "native/cuda/hygon/dtk_i8_blas.h"
 
 namespace infini::ops {
 namespace hygon_i8_gemm {
@@ -42,6 +43,16 @@ __global__ void matmul(T* out, const int8_t* a, const float* as,
     }
     __syncthreads();
   }
+}
+
+static __global__ void prefill_projection_epilogue(__nv_bfloat16* out, const int32_t* dots,
+                                                    const float* as, const float* bs,
+                                                    size_t elements, size_t columns) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) return;
+  const float scale = __fmul_rn(as[idx / columns], bs[idx % columns]);
+  const float value = __fmul_rn(static_cast<float>(dots[idx]), scale);
+  out[idx] = Caster<Device::Type::kHygon>::Cast<__nv_bfloat16>(value);
 }
 
 static constexpr unsigned kProjectionRows = 4;
@@ -109,8 +120,17 @@ static __global__ void matmul_q4_projection(__nv_bfloat16* out, const int8_t* a,
 template <>
 class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
  public:
-  using I8Gemm::I8Gemm;
+  Operator(Tensor c, const Tensor a, const Tensor as, const Tensor b,
+           const Tensor bs, const std::optional<Tensor> bias)
+      : I8Gemm(c, a, as, b, bs, bias) {
+    if (prefill_shape(c, a, bias)) {
+      prefill_workspace_bytes_ = c.numel() * sizeof(int32_t);
+    }
+  }
   bool capture_safe() const override { return true; }
+  size_t workspace_size_in_bytes() const override {
+    return prefill_workspace_bytes_ && prefill_enabled() ? prefill_workspace_bytes_ : 0;
+  }
   static bool supports(Tensor c, Tensor a, Tensor as, Tensor b, Tensor bs,
                        const std::optional<Tensor> bias) {
     if (a.ndim() != 2 || b.ndim() != 2 || c.ndim() != 2 || a.size(1) == 0 ||
@@ -141,6 +161,7 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
       using T = decltype(tag);
       if constexpr (std::is_same_v<T, __nv_bfloat16>) {
         using namespace hygon_i8_gemm;
+        if (launch_prefill(c, a, as, b, bs, bias)) return;
         if (!bias && c.size(0) == kProjectionRows && c.size(1) == kProjectionColumns &&
             a.size(1) == kProjectionK &&
             reinterpret_cast<std::uintptr_t>(a.data()) % alignof(int32_t) == 0 &&
@@ -222,6 +243,43 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
     if (cudaGetLastError() != cudaSuccess)
       throw std::runtime_error("Hygon INT8 GEMM launch failed");
   }
+
+ private:
+  static bool prefill_enabled() {
+    const char* mode = std::getenv("INFINIOPS_V4_I8_PROJECTION_PREFILL_DTK");
+    return mode && mode[0] == '1' && mode[1] == '\0';
+  }
+
+  static bool prefill_shape(Tensor c, Tensor a, const std::optional<Tensor>& bias) {
+    if (bias || a.ndim() != 2 || c.ndim() != 2 || c.dtype() != DataType::kBFloat16) return false;
+    return c.size(0) >= 64 && c.size(0) <= 256 && a.size(1) == 1024 &&
+           (c.size(1) == 4096 || c.size(1) == 8192);
+  }
+
+  bool launch_prefill(Tensor c, Tensor a, Tensor as, Tensor b, Tensor bs,
+                      const std::optional<Tensor>& bias) const {
+    if (!prefill_workspace_bytes_ || !workspace_ || !prefill_enabled() || !prefill_shape(c, a, bias) ||
+        workspace_size_in_bytes_ < c.numel() * sizeof(int32_t)) return false;
+    const auto addresses = reinterpret_cast<uintptr_t>(workspace_) |
+                           reinterpret_cast<uintptr_t>(a.data()) |
+                           reinterpret_cast<uintptr_t>(b.data());
+    if (addresses % 16) return false;
+
+    const auto stream = static_cast<cudaStream_t>(stream_);
+    const auto handle = dtk_i8_blas::Acquire(c.device().index(), stream);
+    if (!handle) return false;
+    auto* dots = static_cast<int32_t*>(workspace_);
+    const auto status = dtk_i8_blas::Dot(handle, dots, static_cast<const int8_t*>(a.data()),
+        static_cast<const int8_t*>(b.data()), int(c.size(0)), int(c.size(1)), int(a.size(1)));
+    if (status != CUBLAS_STATUS_SUCCESS) return false;
+    constexpr unsigned threads = 256;
+    hygon_i8_gemm::prefill_projection_epilogue<<<(c.numel() + threads - 1) / threads, threads, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(c.data()), dots, static_cast<const float*>(as.data()),
+        static_cast<const float*>(bs.data()), c.numel(), c.size(1));
+    return true;
+  }
+
+  size_t prefill_workspace_bytes_{};
 };
 
 }  // namespace infini::ops
