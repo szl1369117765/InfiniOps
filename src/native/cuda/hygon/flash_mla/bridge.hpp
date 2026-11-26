@@ -32,20 +32,21 @@ struct Arguments {
 
 inline constexpr int kMaxScheduleRows = 4;
 inline constexpr int kMaxSchedulePartitions = 1024;
-inline constexpr size_t kScheduleStorageBytes = 32 * kMaxSchedulePartitions + 64;
+inline constexpr size_t kScheduleStorageBytes =
+    32 * kMaxSchedulePartitions + 64;
 
 inline size_t scheduled_workspace_bytes(size_t rows, size_t partitions) {
   constexpr size_t heads = 64, dim = 512;
   const size_t queries = rows * heads;
   const size_t splits = (rows + partitions) * heads;
   // Each allocation in the bridge starts at a 256-byte boundary.
-  return 6 * 256 + queries * dim * 4 + queries * 4 +
-      splits * (dim + 1) * 4 + heads * 4;
+  return 6 * 256 + queries * dim * 4 + queries * 4 + splits * (dim + 1) * 4 +
+         heads * 4;
 }
 
 inline size_t workspace_bytes(size_t rows, size_t partitions) {
   return scheduled_workspace_bytes(rows, partitions) + 2 * 256 +
-      partitions * 32 + (rows + 1) * 4;
+         partitions * 32 + (rows + 1) * 4;
 }
 
 void run(const Arguments& args);

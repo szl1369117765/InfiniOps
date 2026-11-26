@@ -119,8 +119,9 @@ static constexpr unsigned kC128Window = 128;
 static constexpr unsigned kC128Tiles = kC128HeadDim / kC128ChannelsPerBlock;
 
 static __global__ void PoolC128Short(const float* projection, const float* ape,
-                                    const int32_t* sources, const float* state, float* out,
-                                    size_t input_rows, size_t state_rows) {
+                                     const int32_t* sources, const float* state,
+                                     float* out, size_t input_rows,
+                                     size_t state_rows) {
   __shared__ float maxima[kC128Groups][kC128ChannelsPerBlock];
   __shared__ float sums[kC128Groups][kC128ChannelsPerBlock];
   __shared__ float products[kC128Groups][kC128ChannelsPerBlock];
@@ -128,8 +129,10 @@ static __global__ void PoolC128Short(const float* projection, const float* ape,
   const size_t row = blockIdx.x / kC128Tiles;
   const unsigned channel_lane = threadIdx.x % kC128ChannelsPerBlock;
   const unsigned group_lane = threadIdx.x / kC128ChannelsPerBlock;
-  const size_t channel = (blockIdx.x % kC128Tiles) * kC128ChannelsPerBlock + channel_lane;
-  for (unsigned group = group_lane; group < kC128Groups; group += kC128GroupWorkers) {
+  const size_t channel =
+      (blockIdx.x % kC128Tiles) * kC128ChannelsPerBlock + channel_lane;
+  for (unsigned group = group_lane; group < kC128Groups;
+       group += kC128GroupWorkers) {
     float values[8], scores[8], maximum = -INFINITY;
     for (unsigned i = 0; i < 8; ++i) {
       const size_t position = group * 8 + i;
@@ -199,15 +202,17 @@ class Operator<DeepseekV4Compress, Device::Type::kHygon> : public DeepseekV4Comp
         state.ndim() != 2 || out.ndim() != 2) return false;
     const auto window = sources.size(1), dim = out.size(1);
     if ((window != 8 && window != 128) || (dim != 128 && dim != 512) ||
-        (window == 128 && dim != 512) || !projection.size(0) || !state.size(0) ||
-        projection.size(1) != dim * (window == 8 ? 4 : 2) ||
+        (window == 128 && dim != 512) || !projection.size(0) ||
+        !state.size(0) || projection.size(1) != dim * (window == 8 ? 4 : 2) ||
         state.size(1) != projection.size(1) ||
-        (!sources.size(0) && (window != 128 || projection.dtype() != DataType::kFloat32 ||
-                             projection.size(0) < 2 || projection.size(0) > 4)) ||
+        (!sources.size(0) &&
+         (window != 128 || projection.dtype() != DataType::kFloat32 ||
+          projection.size(0) < 2 || projection.size(0) > 4)) ||
         (ape.shape() != Tensor::Shape{window, dim} &&
          (window != 8 || ape.shape() != Tensor::Shape{4, 2 * dim})) ||
         out.size(0) != sources.size(0) ||
-        slots.shape() != Tensor::Shape{projection.size(0)}) return false;
+        slots.shape() != Tensor::Shape{projection.size(0)})
+      return false;
     for (const auto* t : {&projection, &ape, &sources, &slots, &state, &out}) {
       if (t->device() != projection.device() || !t->IsContiguous())
         return false;
@@ -249,10 +254,12 @@ class Operator<DeepseekV4Compress, Device::Type::kHygon> : public DeepseekV4Comp
             use_short_c128 = enabled;
             if (use_short_c128) {
               PoolC128Short<<<static_cast<unsigned>(out.size(0)) * kC128Tiles,
-                              kC128ChannelsPerBlock * kC128GroupWorkers, 0, stream>>>(
+                              kC128ChannelsPerBlock * kC128GroupWorkers, 0,
+                              stream>>>(
                   data, static_cast<const float*>(ape.data()),
                   static_cast<const int32_t*>(sources.data()), state_data,
-                  static_cast<float*>(out.data()), projection.size(0), state.size(0));
+                  static_cast<float*>(out.data()), projection.size(0),
+                  state.size(0));
             }
           }
         }
@@ -263,7 +270,8 @@ class Operator<DeepseekV4Compress, Device::Type::kHygon> : public DeepseekV4Comp
               static_cast<T*>(out.data()), projection.size(0), state.size(0),
               out.size(0), out.size(1), sources.size(1), ape.size(0) == 4);
         }
-        if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("DeepSeek V4 pooling launch failed");
+        if (cudaGetLastError() != cudaSuccess)
+          throw std::runtime_error("DeepSeek V4 pooling launch failed");
       }
       Update<T><<<grid(projection.size(0)), 128, 0, stream>>>(
           data, static_cast<const int32_t*>(slots.data()), state_data, projection.size(0),

@@ -46,9 +46,9 @@ __global__ void matmul(T* out, const int8_t* a, const float* as,
   }
 }
 
-static __global__ void prefill_projection_epilogue(__nv_bfloat16* out, const int32_t* dots,
-                                                    const float* as, const float* bs,
-                                                    size_t elements, size_t columns) {
+static __global__ void prefill_projection_epilogue(
+    __nv_bfloat16* out, const int32_t* dots, const float* as, const float* bs,
+    size_t elements, size_t columns) {
   const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= elements) return;
   const float scale = __fmul_rn(as[idx / columns], bs[idx % columns]);
@@ -58,19 +58,24 @@ static __global__ void prefill_projection_epilogue(__nv_bfloat16* out, const int
 
 static constexpr unsigned kProjectionRows = 4;
 static constexpr unsigned kProjectionM12Tiles = 3;
-static constexpr unsigned kProjectionM12Rows = kProjectionRows * kProjectionM12Tiles;
+static constexpr unsigned kProjectionM12Rows =
+    kProjectionRows * kProjectionM12Tiles;
 static constexpr unsigned kProjectionColumns = 4096;
 static constexpr unsigned kProjectionK = 1024;
 static constexpr unsigned kWave = 64;
 static constexpr unsigned kWavesPerBlock = 4;
 
-static __device__ __forceinline__ int32_t LoadProjectionInt8x4(const int8_t* input) {
+static __device__ __forceinline__ int32_t
+LoadProjectionInt8x4(const int8_t* input) {
   int32_t packed;
-  __builtin_memcpy(&packed, __builtin_assume_aligned(input, alignof(int32_t)), sizeof(packed));
+  __builtin_memcpy(&packed, __builtin_assume_aligned(input, alignof(int32_t)),
+                   sizeof(packed));
   return packed;
 }
 
-static __device__ __forceinline__ int32_t ProjectionDot4(int32_t lhs, int32_t rhs, int32_t sum) {
+static __device__ __forceinline__ int32_t ProjectionDot4(int32_t lhs,
+                                                         int32_t rhs,
+                                                         int32_t sum) {
 #if defined(__AMDGCN__) && __has_builtin(__builtin_amdgcn_sdot4)
   return __builtin_amdgcn_sdot4(lhs, rhs, sum, false);
 #else
@@ -85,48 +90,56 @@ static __device__ __forceinline__ int32_t ProjectionDot4(int32_t lhs, int32_t rh
 #endif
 }
 
-static __device__ __forceinline__ void ProjectionQ4Tile(
-    __nv_bfloat16* out, const int8_t* a, const float* as, const int8_t* b, const float* bs) {
+static __device__ __forceinline__ void ProjectionQ4Tile(__nv_bfloat16* out,
+                                                        const int8_t* a,
+                                                        const float* as,
+                                                        const int8_t* b,
+                                                        const float* bs) {
   const unsigned lane = threadIdx.x % kWave;
   const unsigned col = blockIdx.x * kWavesPerBlock + threadIdx.x / kWave;
   const int8_t* weight = b + col * kProjectionK;
   int32_t dot[kProjectionRows] = {};
-  #pragma unroll
+#pragma unroll
   for (unsigned k = lane * 4; k < kProjectionK; k += kWave * 4) {
     const int32_t packed_weight = LoadProjectionInt8x4(weight + k);
-    #pragma unroll
+#pragma unroll
     for (unsigned row = 0; row < kProjectionRows; ++row) {
-      const int32_t packed_input = LoadProjectionInt8x4(a + row * kProjectionK + k);
+      const int32_t packed_input =
+          LoadProjectionInt8x4(a + row * kProjectionK + k);
       dot[row] = ProjectionDot4(packed_input, packed_weight, dot[row]);
     }
   }
-  #pragma unroll
+#pragma unroll
   for (unsigned offset = kWave / 2; offset; offset /= 2) {
-    #pragma unroll
+#pragma unroll
     for (unsigned row = 0; row < kProjectionRows; ++row) {
       dot[row] += __shfl_down(dot[row], offset, kWave);
     }
   }
   if (lane == 0) {
     using Convert = Caster<Device::Type::kHygon>;
-    #pragma unroll
+#pragma unroll
     for (unsigned row = 0; row < kProjectionRows; ++row) {
       const float scale = __fmul_rn(as[row], bs[col]);
       const float value = __fmul_rn(static_cast<float>(dot[row]), scale);
-      out[row * kProjectionColumns + col] = Convert::template Cast<__nv_bfloat16>(value);
+      out[row * kProjectionColumns + col] =
+          Convert::template Cast<__nv_bfloat16>(value);
     }
   }
 }
 
 static __global__ void matmul_q4_projection(__nv_bfloat16* out, const int8_t* a,
-                                            const float* as, const int8_t* b, const float* bs) {
+                                            const float* as, const int8_t* b,
+                                            const float* bs) {
   ProjectionQ4Tile(out, a, as, b, bs);
 }
 
-static __global__ void matmul_m12_projection(__nv_bfloat16* out, const int8_t* a,
-                                             const float* as, const int8_t* b, const float* bs) {
+static __global__ void matmul_m12_projection(__nv_bfloat16* out,
+                                             const int8_t* a, const float* as,
+                                             const int8_t* b, const float* bs) {
   const size_t row = size_t(blockIdx.y) * kProjectionRows;
-  ProjectionQ4Tile(out + row * kProjectionColumns, a + row * kProjectionK, as + row, b, bs);
+  ProjectionQ4Tile(out + row * kProjectionColumns, a + row * kProjectionK,
+                   as + row, b, bs);
 }
 
 }  // namespace hygon_i8_gemm
@@ -143,7 +156,9 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
   }
   bool capture_safe() const override { return true; }
   size_t workspace_size_in_bytes() const override {
-    return prefill_workspace_bytes_ && prefill_enabled() ? prefill_workspace_bytes_ : 0;
+    return prefill_workspace_bytes_ && prefill_enabled()
+               ? prefill_workspace_bytes_
+               : 0;
   }
   static bool supports(Tensor c, Tensor a, Tensor as, Tensor b, Tensor bs,
                        const std::optional<Tensor> bias) {
@@ -178,28 +193,36 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
         using namespace hygon_i8_gemm;
         if (launch_prefill(c, a, as, b, bs, bias)) return;
         const bool m12 = c.size(0) == kProjectionM12Rows;
-        if (!bias && (c.size(0) == kProjectionRows || m12) && c.size(1) == kProjectionColumns &&
-            a.size(1) == kProjectionK &&
-            reinterpret_cast<std::uintptr_t>(a.data()) % alignof(int32_t) == 0 &&
-            reinterpret_cast<std::uintptr_t>(b.data()) % alignof(int32_t) == 0) {
-          const char* value = std::getenv(m12 ? "INFINIOPS_V4_I8_PROJECTION_M12"
-                                            : "INFINIOPS_V4_I8_PROJECTION_Q4");
+        if (!bias && (c.size(0) == kProjectionRows || m12) &&
+            c.size(1) == kProjectionColumns && a.size(1) == kProjectionK &&
+            reinterpret_cast<std::uintptr_t>(a.data()) % alignof(int32_t) ==
+                0 &&
+            reinterpret_cast<std::uintptr_t>(b.data()) % alignof(int32_t) ==
+                0) {
+          const char* value =
+              std::getenv(m12 ? "INFINIOPS_V4_I8_PROJECTION_M12"
+                              : "INFINIOPS_V4_I8_PROJECTION_Q4");
           const bool enabled = value && value[0] == '1' && value[1] == '\0';
           if (enabled) {
             if (m12) {
-              const dim3 grid(kProjectionColumns / kWavesPerBlock, kProjectionM12Tiles);
+              const dim3 grid(kProjectionColumns / kWavesPerBlock,
+                              kProjectionM12Tiles);
               matmul_m12_projection<<<grid, kWave * kWavesPerBlock, 0,
                                       static_cast<cudaStream_t>(stream_)>>>(
-                  static_cast<T*>(c.data()), static_cast<const int8_t*>(a.data()),
-                  static_cast<const float*>(as.data()), static_cast<const int8_t*>(b.data()),
+                  static_cast<T*>(c.data()),
+                  static_cast<const int8_t*>(a.data()),
+                  static_cast<const float*>(as.data()),
+                  static_cast<const int8_t*>(b.data()),
                   static_cast<const float*>(bs.data()));
               used_m12_projection = true;
               return;
             }
-            matmul_q4_projection<<<kProjectionColumns / kWavesPerBlock, kWave * kWavesPerBlock,
-                                   0, static_cast<cudaStream_t>(stream_)>>>(
+            matmul_q4_projection<<<kProjectionColumns / kWavesPerBlock,
+                                   kWave * kWavesPerBlock, 0,
+                                   static_cast<cudaStream_t>(stream_)>>>(
                 static_cast<T*>(c.data()), static_cast<const int8_t*>(a.data()),
-                static_cast<const float*>(as.data()), static_cast<const int8_t*>(b.data()),
+                static_cast<const float*>(as.data()),
+                static_cast<const int8_t*>(b.data()),
                 static_cast<const float*>(bs.data()));
             return;
           }
@@ -281,16 +304,21 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
     return mode && mode[0] == '1' && mode[1] == '\0';
   }
 
-  static bool prefill_shape(Tensor c, Tensor a, const std::optional<Tensor>& bias) {
-    if (bias || a.ndim() != 2 || c.ndim() != 2 || c.dtype() != DataType::kBFloat16) return false;
+  static bool prefill_shape(Tensor c, Tensor a,
+                            const std::optional<Tensor>& bias) {
+    if (bias || a.ndim() != 2 || c.ndim() != 2 ||
+        c.dtype() != DataType::kBFloat16)
+      return false;
     return c.size(0) >= 64 && c.size(0) <= 256 && a.size(1) == 1024 &&
            (c.size(1) == 4096 || c.size(1) == 8192);
   }
 
   bool launch_prefill(Tensor c, Tensor a, Tensor as, Tensor b, Tensor bs,
                       const std::optional<Tensor>& bias) const {
-    if (!prefill_workspace_bytes_ || !workspace_ || !prefill_enabled() || !prefill_shape(c, a, bias) ||
-        workspace_size_in_bytes_ < c.numel() * sizeof(int32_t)) return false;
+    if (!prefill_workspace_bytes_ || !workspace_ || !prefill_enabled() ||
+        !prefill_shape(c, a, bias) ||
+        workspace_size_in_bytes_ < c.numel() * sizeof(int32_t))
+      return false;
     const auto addresses = reinterpret_cast<uintptr_t>(workspace_) |
                            reinterpret_cast<uintptr_t>(a.data()) |
                            reinterpret_cast<uintptr_t>(b.data());
@@ -300,12 +328,16 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
     const auto handle = dtk_i8_blas::Acquire(c.device().index(), stream);
     if (!handle) return false;
     auto* dots = static_cast<int32_t*>(workspace_);
-    const auto status = dtk_i8_blas::Dot(handle, dots, static_cast<const int8_t*>(a.data()),
-        static_cast<const int8_t*>(b.data()), int(c.size(0)), int(c.size(1)), int(a.size(1)));
+    const auto status =
+        dtk_i8_blas::Dot(handle, dots, static_cast<const int8_t*>(a.data()),
+                         static_cast<const int8_t*>(b.data()), int(c.size(0)),
+                         int(c.size(1)), int(a.size(1)));
     if (status != CUBLAS_STATUS_SUCCESS) return false;
     constexpr unsigned threads = 256;
-    hygon_i8_gemm::prefill_projection_epilogue<<<(c.numel() + threads - 1) / threads, threads, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(c.data()), dots, static_cast<const float*>(as.data()),
+    hygon_i8_gemm::prefill_projection_epilogue<<<
+        (c.numel() + threads - 1) / threads, threads, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(c.data()), dots,
+        static_cast<const float*>(as.data()),
         static_cast<const float*>(bs.data()), c.numel(), c.size(1));
     return true;
   }
