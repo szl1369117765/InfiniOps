@@ -325,74 +325,148 @@ __device__ __forceinline__ unsigned short causal_encode_bits(float value) {
   return bits;
 }
 
+// Compact kernels are selected only when every addressed byte fits in
+// signed 32 bits. Larger state pools retain the original size_t path.
+template <bool kCompact, typename T, typename Index>
+__device__ __forceinline__ T *causal_decode_indexed_offset(T *base,
+                                                           Index index) {
+  if constexpr (kCompact) {
+    using Byte = std::conditional_t<std::is_const_v<T>, const char, char>;
+    const uint32_t bytes = static_cast<uint32_t>(index) * sizeof(T);
+    return reinterpret_cast<T *>(reinterpret_cast<Byte *>(base) + bytes);
+  } else {
+    return base + index;
+  }
+}
+
+template <>
+__device__ __forceinline__ unsigned short causal_encode_bits<__nv_bfloat16>(
+    float value) {
+  const uint32_t bits = __float_as_uint(value);
+  const uint32_t rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+  return __builtin_amdgcn_classf(value, 3)
+             ? 0x7fffu
+             : static_cast<unsigned short>(rounded >> 16);
+}
+
 struct alignas(4) CausalHistoryPair {
   unsigned int values[3];
 };
 
-template <typename T, int kThreads>
+__device__ __forceinline__ float causal_conv1d_fp16_accumulate_pair(
+    unsigned int w01, unsigned int w23, unsigned int h01, unsigned int h2x) {
+  return causal_decode_bits<half>(w01) * causal_decode_bits<half>(h01) +
+         causal_decode_bits<half>(w01 >> 16) *
+             causal_decode_bits<half>(h01 >> 16) +
+         causal_decode_bits<half>(w23) * causal_decode_bits<half>(h2x) +
+         causal_decode_bits<half>(w23 >> 16) *
+             causal_decode_bits<half>(h2x >> 16);
+}
+
+// Round the accumulation to FP16 before adding the FP16 bias, as in
+// conv4_with_bias<half>. Packed addition avoids the intermediate float
+// conversion while retaining both rounding points.
+__device__ __forceinline__ unsigned int causal_conv1d_fp16_pair_output(
+    const CausalHistoryPair &history, const uint4 &weights,
+    unsigned int current, unsigned int biases) {
+  const float first = causal_conv1d_fp16_accumulate_pair(
+      weights.x, weights.y, history.values[0],
+      (history.values[1] & 0xffffu) | (current << 16));
+  const float second = causal_conv1d_fp16_accumulate_pair(
+      weights.z, weights.w,
+      (history.values[1] >> 16) | (history.values[2] << 16),
+      (history.values[2] >> 16) | (current & 0xffff0000u));
+  const __half2 rounded =
+      __halves2half2(__float2half_rn(first), __float2half_rn(second));
+  __half2 bias_pair;
+  __builtin_memcpy(&bias_pair, &biases, sizeof(bias_pair));
+  const __half2 output = __hadd2(rounded, bias_pair);
+  unsigned int packed;
+  __builtin_memcpy(&packed, &output, sizeof(packed));
+  return packed;
+}
+
+template <typename T, int kThreads, bool kCompact = false>
 __global__ __launch_bounds__(kThreads) void causal_conv1d_k4_decode_pair_kernel(
     T *out, T *conv_state, const T *qkv, const T *weight, const T *bias,
     const int32_t *initial_state_indices, const int32_t *final_state_indices,
-    size_t pool_size, const T *history_snapshot) {
+    std::conditional_t<kCompact, uint32_t, size_t> pool_size,
+    const T *history_snapshot) {
   constexpr int kChannels = 4096;
+  using Index = std::conditional_t<kCompact, uint32_t, ptrdiff_t>;
   const int request = blockIdx.y;
   const int channel = (blockIdx.x * kThreads + threadIdx.x) * 2;
   const int read_slot = initial_state_indices == nullptr
                             ? request
                             : initial_state_indices[request];
   const int write_slot = final_state_indices[request];
-  if (read_slot < 0 || write_slot < 0 ||
-      static_cast<size_t>(read_slot) >= pool_size ||
-      static_cast<size_t>(write_slot) >= pool_size)
-    return;
-  const ptrdiff_t read_base =
-      (static_cast<ptrdiff_t>(history_snapshot ? request : read_slot) *
-           kChannels +
+  if constexpr (kCompact) {
+    if (static_cast<uint32_t>(read_slot) >= pool_size ||
+        static_cast<uint32_t>(write_slot) >= pool_size)
+      return;
+    __builtin_assume(channel >= 0 && channel < 4096);
+    __builtin_assume(request >= 0 && request < 65535);
+  } else {
+    if (read_slot < 0 || write_slot < 0 ||
+        static_cast<size_t>(read_slot) >= pool_size ||
+        static_cast<size_t>(write_slot) >= pool_size)
+      return;
+  }
+  const Index read_base =
+      (static_cast<Index>(history_snapshot ? request : read_slot) * kChannels +
        channel) *
       3;
-  const ptrdiff_t write_base =
-      (static_cast<ptrdiff_t>(write_slot) * kChannels + channel) * 3;
-  const ptrdiff_t input_base =
-      static_cast<ptrdiff_t>(request) * kChannels + channel;
+  const Index write_base =
+      (static_cast<Index>(write_slot) * kChannels + channel) * 3;
+  const Index input_base = static_cast<Index>(request) * kChannels + channel;
   const CausalHistoryPair history =
       *reinterpret_cast<const CausalHistoryPair *>(
-          (history_snapshot ? history_snapshot : conv_state) + read_base);
-  const uint4 weights = *reinterpret_cast<const uint4 *>(weight + channel * 4);
-  const unsigned int current =
-      *reinterpret_cast<const unsigned int *>(qkv + input_base);
-  const unsigned int biases =
-      *reinterpret_cast<const unsigned int *>(bias + channel);
-  const unsigned int packed_weights[4] = {weights.x, weights.y, weights.z,
-                                          weights.w};
-  const unsigned int raw_history[6] = {
-      history.values[0], history.values[0] >> 16,
-      history.values[1], history.values[1] >> 16,
-      history.values[2], history.values[2] >> 16};
-  unsigned short encoded[2];
+          causal_decode_indexed_offset<kCompact>(
+              (history_snapshot ? history_snapshot : conv_state), read_base));
+  const uint4 weights = *reinterpret_cast<const uint4 *>(
+      causal_decode_indexed_offset<kCompact>(weight, channel * 4));
+  const unsigned int current = *reinterpret_cast<const unsigned int *>(
+      causal_decode_indexed_offset<kCompact>(qkv, input_base));
+  const unsigned int biases = *reinterpret_cast<const unsigned int *>(
+      causal_decode_indexed_offset<kCompact>(bias, channel));
+  if constexpr (std::is_same_v<T, half>) {
+    *reinterpret_cast<unsigned int *>(
+        causal_decode_indexed_offset<kCompact>(out, input_base)) =
+        causal_conv1d_fp16_pair_output(history, weights, current, biases);
+  } else {
+    const unsigned int packed_weights[4] = {weights.x, weights.y, weights.z,
+                                            weights.w};
+    const unsigned int raw_history[6] = {
+        history.values[0], history.values[0] >> 16,
+        history.values[1], history.values[1] >> 16,
+        history.values[2], history.values[2] >> 16};
+    unsigned short encoded[2];
 #pragma unroll
-  for (int offset = 0; offset < 2; ++offset) {
-    const unsigned int first = packed_weights[offset * 2];
-    const unsigned int second = packed_weights[offset * 2 + 1];
-    const float result =
-        conv4_with_bias<T>(causal_decode_bits<T>(first),
-                           causal_decode_bits<T>(raw_history[offset * 3]),
-                           causal_decode_bits<T>(first >> 16),
-                           causal_decode_bits<T>(raw_history[offset * 3 + 1]),
-                           causal_decode_bits<T>(second),
-                           causal_decode_bits<T>(raw_history[offset * 3 + 2]),
-                           causal_decode_bits<T>(second >> 16),
-                           causal_decode_bits<T>(current >> (offset * 16)),
-                           causal_decode_bits<T>(biases >> (offset * 16)));
-    encoded[offset] = causal_encode_bits<T>(result);
+    for (int offset = 0; offset < 2; ++offset) {
+      const unsigned int first = packed_weights[offset * 2];
+      const unsigned int second = packed_weights[offset * 2 + 1];
+      const float result =
+          conv4_with_bias<T>(causal_decode_bits<T>(first),
+                             causal_decode_bits<T>(raw_history[offset * 3]),
+                             causal_decode_bits<T>(first >> 16),
+                             causal_decode_bits<T>(raw_history[offset * 3 + 1]),
+                             causal_decode_bits<T>(second),
+                             causal_decode_bits<T>(raw_history[offset * 3 + 2]),
+                             causal_decode_bits<T>(second >> 16),
+                             causal_decode_bits<T>(current >> (offset * 16)),
+                             causal_decode_bits<T>(biases >> (offset * 16)));
+      encoded[offset] = causal_encode_bits<T>(result);
+    }
+    *reinterpret_cast<unsigned int *>(causal_decode_indexed_offset<kCompact>(
+        out, input_base)) = static_cast<unsigned int>(encoded[0]) |
+                            (static_cast<unsigned int>(encoded[1]) << 16);
   }
-  *reinterpret_cast<unsigned int *>(out + input_base) =
-      static_cast<unsigned int>(encoded[0]) |
-      (static_cast<unsigned int>(encoded[1]) << 16);
   CausalHistoryPair updated;
   updated.values[0] = (history.values[0] >> 16) | (history.values[1] << 16);
   updated.values[1] = (current & 0xffffu) | (history.values[2] << 16);
   updated.values[2] = (history.values[2] >> 16) | (current & 0xffff0000u);
-  *reinterpret_cast<CausalHistoryPair *>(conv_state + write_base) = updated;
+  *reinterpret_cast<CausalHistoryPair *>(
+      causal_decode_indexed_offset<kCompact>(conv_state, write_base)) = updated;
 }
 
 template <typename T, int kTimeTile, int kChannelsPerThread,
@@ -837,6 +911,227 @@ __global__ void causal_conv1d_k4_kernel(
 }  // anonymous namespace
 namespace {
 
+// Snapshot before any request can write the shared pool. This also protects
+// aliased explicit final-state views and arbitrary initial-slot permutations.
+template <typename T>
+__global__ void causal_conv1d_snapshot_history(T *snapshot, const T *state,
+                                               const void *initial_indices,
+                                               bool indices_i64, size_t count,
+                                               size_t channels,
+                                               size_t pool_size, ptrdiff_t s0,
+                                               ptrdiff_t s1, ptrdiff_t s2) {
+  for (size_t linear =
+           static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       linear < count; linear += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const size_t request = linear / (channels * 3);
+    const int64_t slot =
+        load_optional_index(initial_indices, indices_i64, request, request);
+    if (slot < 0 || static_cast<size_t>(slot) >= pool_size) continue;
+    snapshot[linear] =
+        state[static_cast<ptrdiff_t>(slot) * s0 +
+              static_cast<ptrdiff_t>((linear / 3) % channels) * s1 +
+              static_cast<ptrdiff_t>(linear % 3) * s2];
+  }
+}
+
+// One block owns a channel tile across all requests. The barrier protects
+// every initial-slot read from every final-slot write, including permutations.
+// This short recurrence needs no separate snapshot node or global workspace.
+constexpr int kPoolChannelsPerBlock = 32;
+constexpr int kMaxPoolRequestCapacity = 32;
+
+template <typename T, int kRequestCapacity>
+__global__
+__launch_bounds__(kRequestCapacity *kPoolChannelsPerBlock) void causal_conv1d_k4_short_pool_kernel(
+    T *out, T *state, const T *x, const T *weight, const T *bias,
+    const void *initial_indices, const void *final_indices, bool initial_i64,
+    bool final_i64, size_t requests, size_t tokens, size_t channels,
+    size_t pool_size, ptrdiff_t x0, ptrdiff_t x1, ptrdiff_t x2, ptrdiff_t o0,
+    ptrdiff_t o1, ptrdiff_t o2, ptrdiff_t s0, ptrdiff_t s1, ptrdiff_t s2,
+    ptrdiff_t w0, ptrdiff_t w2, ptrdiff_t b0) {
+  const int request = threadIdx.x / kPoolChannelsPerBlock;
+  const size_t channel =
+      static_cast<size_t>(blockIdx.x) * kPoolChannelsPerBlock +
+      threadIdx.x % kPoolChannelsPerBlock;
+  bool active = request < requests && channel < channels;
+  int64_t read_slot = 0, write_slot = 0;
+  float h0 = 0.0f, h1 = 0.0f, h2 = 0.0f;
+  if (active) {
+    read_slot =
+        load_optional_index(initial_indices, initial_i64, request, request);
+    write_slot =
+        load_optional_index(final_indices, final_i64, request, request);
+    active = read_slot >= 0 && write_slot >= 0 &&
+             static_cast<size_t>(read_slot) < pool_size &&
+             static_cast<size_t>(write_slot) < pool_size;
+    if (active) {
+      const ptrdiff_t base = read_slot * s0 + channel * s1;
+      h0 = load_as_float(state, base);
+      h1 = load_as_float(state, base + s2);
+      h2 = load_as_float(state, base + 2 * s2);
+    }
+  }
+  // Padding and invalid-slot threads must participate before returning.
+  __syncthreads();
+  if (!active) return;
+  const ptrdiff_t wb = channel * w0;
+  const float a0 = load_as_float(weight, wb);
+  const float a1 = load_as_float(weight, wb + w2);
+  const float a2 = load_as_float(weight, wb + 2 * w2);
+  const float a3 = load_as_float(weight, wb + 3 * w2);
+  const float bias_value = bias ? load_as_float(bias, channel * b0) : 0.0f;
+  ptrdiff_t input = static_cast<ptrdiff_t>(request) * x0 + channel * x2;
+  ptrdiff_t output = static_cast<ptrdiff_t>(request) * o0 + channel * o2;
+  for (size_t token = 0; token < tokens; ++token) {
+    const float value = load_as_float(x, input);
+    out[output] = cast_from_float<T>(
+        conv4_with_bias<T>(a0, h0, a1, h1, a2, h2, a3, value, bias_value));
+    h0 = h1;
+    h1 = h2;
+    h2 = value;
+    input += x1;
+    output += o1;
+  }
+  const ptrdiff_t target = write_slot * s0 + channel * s1;
+  state[target] = cast_from_float<T>(h0);
+  state[target + s2] = cast_from_float<T>(h1);
+  state[target + 2 * s2] = cast_from_float<T>(h2);
+}
+
+// Read both channels for every request before the block-wide write barrier.
+// Packed accesses retain the same state-pool permutation semantics.
+template <typename T, int kCapacity, int kPairs = 16, bool kCompact = false,
+          bool kWaveOwned = false>
+__global__ __launch_bounds__(
+    kCapacity *
+        kPairs) void causal_conv1d_k4_short_pool_pair_kernel(T *out, T *state,
+                                                             const T *x,
+                                                             const T *weight,
+                                                             const T *bias,
+                                                             const int32_t
+                                                                 *initial,
+                                                             const int32_t
+                                                                 *final,
+                                                             std::conditional_t<
+                                                                 kCompact ||
+                                                                     kWaveOwned,
+                                                                 uint32_t,
+                                                                 size_t>
+                                                                 requests,
+                                                             std::conditional_t<
+                                                                 kCompact,
+                                                                 uint32_t,
+                                                                 size_t>
+                                                                 pool_size) {
+  constexpr int kPairsPerBlock = kPairs;
+  using Index = std::conditional_t<kCompact, uint32_t, ptrdiff_t>;
+  constexpr int kChannels = 4096;
+  static_assert(kCapacity <= 32 && 64 % kCapacity == 0);
+  constexpr int kPairsPerWave =
+      kPairs < 64 / kCapacity ? kPairs : 64 / kCapacity;
+  static_assert(!kWaveOwned || kPairs % kPairsPerWave == 0);
+  // Each channel pair owns a complete power-of-two request group in one
+  // wave. Adjacent lanes within each request retain contiguous channels.
+  const int request =
+      kWaveOwned ? (threadIdx.x % (kCapacity * kPairsPerWave)) / kPairsPerWave
+                 : threadIdx.x / kPairsPerBlock;
+  const int pair =
+      kWaveOwned ? (threadIdx.x / (kCapacity * kPairsPerWave)) * kPairsPerWave +
+                       threadIdx.x % kPairsPerWave
+                 : threadIdx.x % kPairsPerBlock;
+  const int channel = (blockIdx.x * kPairsPerBlock + pair) * 2;
+  bool active = request < requests;
+  if constexpr (4096 % (kPairs * 2) != 0)
+    active = active && channel < kChannels;
+  int read_slot = 0, write_slot = 0;
+  CausalHistoryPair history{};
+  if (active) {
+    read_slot = initial ? initial[request] : request;
+    write_slot = final[request];
+    if constexpr (kCompact) {
+      active = static_cast<uint32_t>(read_slot) < pool_size &&
+               static_cast<uint32_t>(write_slot) < pool_size;
+    } else {
+      active = read_slot >= 0 && write_slot >= 0 &&
+               static_cast<size_t>(read_slot) < pool_size &&
+               static_cast<size_t>(write_slot) < pool_size;
+    }
+    if (active)
+      history = *reinterpret_cast<const CausalHistoryPair *>(
+          causal_decode_indexed_offset<kCompact>(
+              state,
+              (static_cast<Index>(read_slot) * kChannels + channel) * 3));
+  }
+  if constexpr (kWaveOwned) {
+    // Every request for a channel pair is in the same wave; all state
+    // loads must complete before any lane overwrites another request's slot.
+    __builtin_amdgcn_wave_barrier();
+  } else {
+    __syncthreads();
+  }
+  if (!active) return;
+  const Index input = static_cast<Index>(request) * kChannels + channel;
+  const uint4 weights = *reinterpret_cast<const uint4 *>(
+      causal_decode_indexed_offset<kCompact>(weight, channel * 4));
+  const unsigned int current = *reinterpret_cast<const unsigned int *>(
+      causal_decode_indexed_offset<kCompact>(x, input));
+  const unsigned int biases = *reinterpret_cast<const unsigned int *>(
+      causal_decode_indexed_offset<kCompact>(bias, channel));
+  if constexpr (std::is_same_v<T, half>) {
+    *reinterpret_cast<unsigned int *>(
+        causal_decode_indexed_offset<kCompact>(out, input)) =
+        causal_conv1d_fp16_pair_output(history, weights, current, biases);
+  } else {
+    const unsigned int packed[4] = {weights.x, weights.y, weights.z, weights.w};
+    const unsigned int raw[6] = {history.values[0], history.values[0] >> 16,
+                                 history.values[1], history.values[1] >> 16,
+                                 history.values[2], history.values[2] >> 16};
+    unsigned short encoded[2];
+#pragma unroll
+    for (int lane = 0; lane < 2; ++lane) {
+      const unsigned int first = packed[lane * 2],
+                         second = packed[lane * 2 + 1];
+      const float value = conv4_with_bias<T>(
+          causal_decode_bits<T>(first), causal_decode_bits<T>(raw[lane * 3]),
+          causal_decode_bits<T>(first >> 16),
+          causal_decode_bits<T>(raw[lane * 3 + 1]),
+          causal_decode_bits<T>(second),
+          causal_decode_bits<T>(raw[lane * 3 + 2]),
+          causal_decode_bits<T>(second >> 16),
+          causal_decode_bits<T>(current >> (lane * 16)),
+          causal_decode_bits<T>(biases >> (lane * 16)));
+      encoded[lane] = causal_encode_bits<T>(value);
+    }
+    *reinterpret_cast<unsigned int *>(causal_decode_indexed_offset<kCompact>(
+        out, input)) = static_cast<unsigned int>(encoded[0]) |
+                       (static_cast<unsigned int>(encoded[1]) << 16);
+  }
+  CausalHistoryPair updated;
+  updated.values[0] = (history.values[0] >> 16) | (history.values[1] << 16);
+  updated.values[1] = (current & 0xffffu) | (history.values[2] << 16);
+  updated.values[2] = (history.values[2] >> 16) | (current & 0xffff0000u);
+  const Index target =
+      (static_cast<Index>(write_slot) * kChannels + channel) * 3;
+  *reinterpret_cast<CausalHistoryPair *>(
+      causal_decode_indexed_offset<kCompact>(state, target)) = updated;
+}
+
+// ---------------------------------------------------------------------------
+// Host launch policy. Metadata chooses a family; pointer/alias checks remain
+// at invocation time. Device arithmetic and state synchronization are above.
+// ---------------------------------------------------------------------------
+inline int short_pool_capacity(const ConvInfo &info) {
+  if (info.has_cu_seqlens || !info.final_indices_kind ||
+      info.request_count <= 1 || info.request_count > kMaxPoolRequestCapacity ||
+      info.T > 4)
+    return 0;
+  int capacity = 2;
+  while (capacity < info.request_count) capacity *= 2;
+  return capacity * kPoolChannelsPerBlock <= info.max_threads_per_block
+             ? capacity
+             : 0;
+}
+
 template <typename T, bool kVectorIO, int kTimeTile, int kThreads, int kVec,
           bool kIndexed>
 void launch_k4_time_tiled_vec_impl(const ConvInfo &info, void *out,
@@ -1036,6 +1331,74 @@ void launch_k4_contiguous_family(const ConvInfo &info, void *out,
       final_state_indices, stream);
 }
 
+// Pointer alignment is checked at invocation time; descriptors may be reused
+// with different storage carrying the same tensor metadata.
+template <typename T>
+bool try_launch_k4_decode(const ConvInfo &info, void *out, void *conv_state,
+                          const void *qkv, const void *weight, const void *bias,
+                          const void *initial_state_indices,
+                          const void *final_state_indices,
+                          cudaStream_t stream) {
+  if constexpr (sizeof(T) == 2) {
+    if (info.T == 1 && info.request_count <= 65535) {
+      if ((reinterpret_cast<uintptr_t>(out) & 3) == 0 &&
+          (reinterpret_cast<uintptr_t>(conv_state) & 3) == 0 &&
+          (reinterpret_cast<uintptr_t>(qkv) & 3) == 0 &&
+          (reinterpret_cast<uintptr_t>(bias) & 3) == 0 &&
+          (reinterpret_cast<uintptr_t>(weight) & 15) == 0) {
+        const auto launch_pair = [&](auto threads) {
+          constexpr int kThreads = decltype(threads)::value;
+          const auto launch_indexed = [&](auto compact) {
+            constexpr bool kCompact = decltype(compact)::value;
+            using PoolSize = std::conditional_t<kCompact, uint32_t, size_t>;
+            causal_conv1d_k4_decode_pair_kernel<T, kThreads, kCompact>
+                <<<dim3(4096 / (kThreads * 2), info.request_count), kThreads, 0,
+                   stream>>>(
+                    static_cast<T *>(out), static_cast<T *>(conv_state),
+                    static_cast<const T *>(qkv), static_cast<const T *>(weight),
+                    static_cast<const T *>(bias),
+                    static_cast<const int32_t *>(initial_state_indices),
+                    static_cast<const int32_t *>(final_state_indices),
+                    static_cast<PoolSize>(info.pool_size),
+                    static_cast<const T *>(info.history));
+          };
+          if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            constexpr size_t kMaxPool = 2147483647ULL / (4096 * 3 * sizeof(T));
+            // The enclosing decode path bounds requests by 65535, so
+            // its input and optional history snapshot also fit.
+            if (info.pool_size <= kMaxPool) {
+              launch_indexed(std::true_type{});
+              return;
+            }
+          }
+          launch_indexed(std::false_type{});
+        };
+        const size_t wide_blocks = info.request_count * (4096 / (128 * 2));
+        if (std::is_same_v<T, half> &&
+            wide_blocks < static_cast<size_t>(info.compute_units))
+          launch_pair(std::integral_constant<int, 64>{});
+        else
+          launch_pair(std::integral_constant<int, 128>{});
+      } else {
+        constexpr int kThreads = 64;
+        causal_conv1d_k4_decode_kernel<T, kThreads>
+            <<<dim3(4096 / kThreads, info.request_count), kThreads, 0,
+               stream>>>(static_cast<T *>(out), static_cast<T *>(conv_state),
+                         static_cast<const T *>(qkv),
+                         static_cast<const T *>(weight),
+                         static_cast<const T *>(bias),
+                         static_cast<const int32_t *>(initial_state_indices),
+                         static_cast<const int32_t *>(final_state_indices),
+                         info.pool_size, static_cast<const T *>(info.history));
+      }
+      if (cudaGetLastError() != cudaSuccess)
+        throw std::runtime_error("Hygon causal conv decode launch failed");
+      return true;
+    }
+  }
+  return false;
+}
+
 template <typename T>
 void launch_k4_impl(const ConvInfo &info, void *out, void *conv_state,
                     void *final_conv_state, const void *qkv, const void *weight,
@@ -1065,40 +1428,10 @@ void launch_k4_impl(const ConvInfo &info, void *out, void *conv_state,
     if (has_indexed_k4_layout(info) &&
         (final_conv_state == nullptr || final_conv_state == conv_state) &&
         final_state_indices != nullptr && bias != nullptr) {
-      if constexpr (sizeof(T) == 2) {
-        if (info.T == 1 && info.request_count <= 65535) {
-          if ((reinterpret_cast<uintptr_t>(out) & 3) == 0 &&
-              (reinterpret_cast<uintptr_t>(conv_state) & 3) == 0 &&
-              (reinterpret_cast<uintptr_t>(qkv) & 3) == 0 &&
-              (reinterpret_cast<uintptr_t>(bias) & 3) == 0 &&
-              (reinterpret_cast<uintptr_t>(weight) & 15) == 0) {
-            constexpr int kThreads = 128;
-            causal_conv1d_k4_decode_pair_kernel<T, kThreads>
-                <<<dim3(4096 / (kThreads * 2), info.request_count), kThreads, 0,
-                   stream>>>(
-                    static_cast<T *>(out), static_cast<T *>(conv_state),
-                    static_cast<const T *>(qkv), static_cast<const T *>(weight),
-                    static_cast<const T *>(bias),
-                    static_cast<const int32_t *>(initial_state_indices),
-                    static_cast<const int32_t *>(final_state_indices),
-                    info.pool_size, static_cast<const T *>(info.history));
-          } else {
-            constexpr int kThreads = 64;
-            causal_conv1d_k4_decode_kernel<T, kThreads>
-                <<<dim3(4096 / kThreads, info.request_count), kThreads, 0,
-                   stream>>>(
-                    static_cast<T *>(out), static_cast<T *>(conv_state),
-                    static_cast<const T *>(qkv), static_cast<const T *>(weight),
-                    static_cast<const T *>(bias),
-                    static_cast<const int32_t *>(initial_state_indices),
-                    static_cast<const int32_t *>(final_state_indices),
-                    info.pool_size, static_cast<const T *>(info.history));
-          }
-          if (cudaGetLastError() != cudaSuccess)
-            throw std::runtime_error("Hygon causal conv decode launch failed");
-          return;
-        }
-      }
+      if (try_launch_k4_decode<T>(info, out, conv_state, qkv, weight, bias,
+                                  initial_state_indices, final_state_indices,
+                                  stream))
+        return;
       const int tile = info.T <= 16 ? 4 : info.T <= 64 ? 8 : 16;
       const size_t blocks =
           1 + (info.T < 4 ? 0 : (info.T - 4 + tile - 1) / tile);
@@ -1155,110 +1488,55 @@ void launch_k4_impl(const ConvInfo &info, void *out, void *conv_state,
     throw std::runtime_error("Hygon causal conv1d launch failed");
 }
 
-// Snapshot before any request can write the shared pool. This also protects
-// aliased explicit final-state views and arbitrary initial-slot permutations.
-template <typename T>
-__global__ void causal_conv1d_snapshot_history(T *snapshot, const T *state,
-                                               const void *initial_indices,
-                                               bool indices_i64, size_t count,
-                                               size_t channels,
-                                               size_t pool_size, ptrdiff_t s0,
-                                               ptrdiff_t s1, ptrdiff_t s2) {
-  for (size_t linear =
-           static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       linear < count; linear += static_cast<size_t>(gridDim.x) * blockDim.x) {
-    const size_t request = linear / (channels * 3);
-    const int64_t slot =
-        load_optional_index(initial_indices, indices_i64, request, request);
-    if (slot < 0 || static_cast<size_t>(slot) >= pool_size) continue;
-    snapshot[linear] =
-        state[static_cast<ptrdiff_t>(slot) * s0 +
-              static_cast<ptrdiff_t>((linear / 3) % channels) * s1 +
-              static_cast<ptrdiff_t>(linear % 3) * s2];
-  }
-}
-
-// One block owns a channel tile across all requests. The barrier protects
-// every initial-slot read from every final-slot write, including permutations.
-// This short recurrence needs no separate snapshot node or global workspace.
-constexpr int kPoolChannelsPerBlock = 32;
-constexpr int kMaxPoolRequestCapacity = 32;
-
-inline int short_pool_capacity(const ConvInfo &info) {
-  if (info.has_cu_seqlens || !info.final_indices_kind ||
-      info.request_count <= 1 || info.request_count > kMaxPoolRequestCapacity ||
-      info.T > 4)
-    return 0;
-  int capacity = 2;
-  while (capacity < info.request_count) capacity *= 2;
-  return capacity * kPoolChannelsPerBlock <= info.max_threads_per_block
-             ? capacity
-             : 0;
-}
-
-template <typename T, int kRequestCapacity>
-__global__
-__launch_bounds__(kRequestCapacity *kPoolChannelsPerBlock) void causal_conv1d_k4_short_pool_kernel(
-    T *out, T *state, const T *x, const T *weight, const T *bias,
-    const void *initial_indices, const void *final_indices, bool initial_i64,
-    bool final_i64, size_t requests, size_t tokens, size_t channels,
-    size_t pool_size, ptrdiff_t x0, ptrdiff_t x1, ptrdiff_t x2, ptrdiff_t o0,
-    ptrdiff_t o1, ptrdiff_t o2, ptrdiff_t s0, ptrdiff_t s1, ptrdiff_t s2,
-    ptrdiff_t w0, ptrdiff_t w2, ptrdiff_t b0) {
-  const int request = threadIdx.x / kPoolChannelsPerBlock;
-  const size_t channel =
-      static_cast<size_t>(blockIdx.x) * kPoolChannelsPerBlock +
-      threadIdx.x % kPoolChannelsPerBlock;
-  bool active = request < requests && channel < channels;
-  int64_t read_slot = 0, write_slot = 0;
-  float h0 = 0.0f, h1 = 0.0f, h2 = 0.0f;
-  if (active) {
-    read_slot =
-        load_optional_index(initial_indices, initial_i64, request, request);
-    write_slot =
-        load_optional_index(final_indices, final_i64, request, request);
-    active = read_slot >= 0 && write_slot >= 0 &&
-             static_cast<size_t>(read_slot) < pool_size &&
-             static_cast<size_t>(write_slot) < pool_size;
-    if (active) {
-      const ptrdiff_t base = read_slot * s0 + channel * s1;
-      h0 = load_as_float(state, base);
-      h1 = load_as_float(state, base + s2);
-      h2 = load_as_float(state, base + 2 * s2);
-    }
-  }
-  // Padding and invalid-slot threads must participate before returning.
-  __syncthreads();
-  if (!active) return;
-  const ptrdiff_t wb = channel * w0;
-  const float a0 = load_as_float(weight, wb);
-  const float a1 = load_as_float(weight, wb + w2);
-  const float a2 = load_as_float(weight, wb + 2 * w2);
-  const float a3 = load_as_float(weight, wb + 3 * w2);
-  const float bias_value = bias ? load_as_float(bias, channel * b0) : 0.0f;
-  ptrdiff_t input = static_cast<ptrdiff_t>(request) * x0 + channel * x2;
-  ptrdiff_t output = static_cast<ptrdiff_t>(request) * o0 + channel * o2;
-  for (size_t token = 0; token < tokens; ++token) {
-    const float value = load_as_float(x, input);
-    out[output] = cast_from_float<T>(
-        conv4_with_bias<T>(a0, h0, a1, h1, a2, h2, a3, value, bias_value));
-    h0 = h1;
-    h1 = h2;
-    h2 = value;
-    input += x1;
-    output += o1;
-  }
-  const ptrdiff_t target = write_slot * s0 + channel * s1;
-  state[target] = cast_from_float<T>(h0);
-  state[target + s2] = cast_from_float<T>(h1);
-  state[target + 2 * s2] = cast_from_float<T>(h2);
-}
-
 template <typename T, int kCapacity>
 void launch_short_pool(const ConvInfo &p, void *out, void *state, const void *x,
                        const void *weight, const void *bias,
                        const void *initial, const void *final,
                        cudaStream_t stream) {
+  if constexpr (sizeof(T) == 2) {
+    if (p.T == 1 && has_indexed_k4_layout(p) &&
+        (reinterpret_cast<uintptr_t>(out) & 3) == 0 &&
+        (reinterpret_cast<uintptr_t>(state) & 3) == 0 &&
+        (reinterpret_cast<uintptr_t>(x) & 3) == 0 &&
+        (reinterpret_cast<uintptr_t>(bias) & 3) == 0 &&
+        (reinterpret_cast<uintptr_t>(weight) & 15) == 0) {
+      const auto launch_config = [&](auto pair_tag, auto compact_tag,
+                                     auto wave_tag) {
+        constexpr int kPairs = decltype(pair_tag)::value;
+        constexpr bool kCompact = decltype(compact_tag)::value;
+        constexpr bool kWaveOwned = decltype(wave_tag)::value;
+        using RequestCount =
+            std::conditional_t<kCompact || kWaveOwned, uint32_t, size_t>;
+        using PoolSize = std::conditional_t<kCompact, uint32_t, size_t>;
+        causal_conv1d_k4_short_pool_pair_kernel<T, kCapacity, kPairs, kCompact,
+                                                kWaveOwned>
+            <<<(4096 + kPairs * 2 - 1) / (kPairs * 2), kCapacity * kPairs, 0,
+               stream>>>(static_cast<T *>(out), static_cast<T *>(state),
+                         static_cast<const T *>(x),
+                         static_cast<const T *>(weight),
+                         static_cast<const T *>(bias),
+                         static_cast<const int32_t *>(initial),
+                         static_cast<const int32_t *>(final),
+                         static_cast<RequestCount>(p.request_count),
+                         static_cast<PoolSize>(p.pool_size));
+      };
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        constexpr size_t kMaxPool = 2147483647ULL / (4096 * 3 * sizeof(T));
+        if (p.pool_size <= kMaxPool)
+          launch_config(std::integral_constant<int, 16>{}, std::true_type{},
+                        std::true_type{});
+        else
+          launch_config(std::integral_constant<int, 16>{}, std::false_type{},
+                        std::true_type{});
+      } else {
+        launch_config(std::integral_constant<int, 16>{}, std::false_type{},
+                      std::false_type{});
+      }
+      if (cudaGetLastError() != cudaSuccess)
+        throw std::runtime_error("Hygon causal conv paired pool launch failed");
+      return;
+    }
+  }
   causal_conv1d_k4_short_pool_kernel<T, kCapacity>
       <<<static_cast<unsigned>((p.C + kPoolChannelsPerBlock - 1) /
                                kPoolChannelsPerBlock),

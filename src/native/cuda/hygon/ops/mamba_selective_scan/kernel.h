@@ -290,7 +290,7 @@ decode_from_float<__nv_bfloat16>(float value) {
   const unsigned int bits = __float_as_uint(value);
   const unsigned int rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
   const unsigned short result =
-      (bits & 0x7fffffffu) > 0x7f800000u
+      __builtin_amdgcn_classf(value, 3)
           ? 0x7fffu
           : static_cast<unsigned short>(rounded >> 16);
   return __ushort_as_bfloat16(result);
@@ -308,51 +308,74 @@ __device__ __forceinline__ T *decode_offset(T *base, ptrdiff_t index) {
   return reinterpret_cast<T *>(reinterpret_cast<Byte *>(base) + offset);
 }
 
+template <bool kCompact, typename T, typename Index>
+__device__ __forceinline__ T *decode_indexed_offset(T *base, Index index) {
+  if constexpr (kCompact) {
+    using Byte = std::conditional_t<std::is_const_v<T>, const char, char>;
+    const uint32_t bytes = static_cast<uint32_t>(index) * sizeof(T);
+    return reinterpret_cast<T *>(reinterpret_cast<Byte *>(base) + bytes);
+  } else {
+    return decode_offset(base, static_cast<ptrdiff_t>(index));
+  }
+}
+
 template <typename T, int kThreads, bool kAligned, int kLanes = 4,
-          bool kPreserveQuadSum = false>
+          bool kPreserveQuadSum = false, bool kCompact = false>
 __global__
 __launch_bounds__(kThreads) void mamba_selective_scan_decode_s16_kernel(
     T *out, const T *x, const T *dt, const T *b, const T *c, const T *a_log,
     const T *d, const T *gate, const T *dt_bias, float *state) {
   constexpr int kStatesPerLane = 16 / kLanes;
+  using Index = std::conditional_t<kCompact, uint32_t, ptrdiff_t>;
   using StateVector = DecodeValues<float, kStatesPerLane>;
   using InputVector = DecodeValues<T, kStatesPerLane>;
   const int channel = blockIdx.x * (kThreads / kLanes) + threadIdx.x / kLanes;
   const int lane = threadIdx.x % kLanes;
-  const ptrdiff_t batch_index = blockIdx.y;
-  const ptrdiff_t linear = batch_index * 4096 + channel;
-  const ptrdiff_t state_base = linear * 16 + lane * kStatesPerLane;
+  const Index batch_index = blockIdx.y;
+  if constexpr (kCompact) {
+    __builtin_assume(channel >= 0 && channel < 4096);
+    __builtin_assume(batch_index < 8192);
+  }
+  const Index linear = batch_index * 4096 + channel;
+  const Index state_base = linear * 16 + lane * kStatesPerLane;
   StateVector previous;
   if constexpr (kAligned) {
     previous = *reinterpret_cast<const StateVector *>(
-        decode_offset(state, state_base));
+        decode_indexed_offset<kCompact>(state, state_base));
   } else {
-    __builtin_memcpy(&previous, decode_offset(state, state_base),
+    __builtin_memcpy(&previous,
+                     decode_indexed_offset<kCompact>(state, state_base),
                      sizeof(StateVector));
   }
   InputVector log_values;
   InputVector b_values;
   InputVector c_values;
   if constexpr (kAligned) {
-    log_values = *reinterpret_cast<const InputVector *>(
-        decode_offset(a_log, channel * 16 + lane * kStatesPerLane));
-    b_values = *reinterpret_cast<const InputVector *>(
-        decode_offset(b, batch_index * 16 + lane * kStatesPerLane));
-    c_values = *reinterpret_cast<const InputVector *>(
-        decode_offset(c, batch_index * 16 + lane * kStatesPerLane));
+    log_values =
+        *reinterpret_cast<const InputVector *>(decode_indexed_offset<kCompact>(
+            a_log, channel * 16 + lane * kStatesPerLane));
+    b_values =
+        *reinterpret_cast<const InputVector *>(decode_indexed_offset<kCompact>(
+            b, batch_index * 16 + lane * kStatesPerLane));
+    c_values =
+        *reinterpret_cast<const InputVector *>(decode_indexed_offset<kCompact>(
+            c, batch_index * 16 + lane * kStatesPerLane));
   }
-  const float x_value = static_cast<float>(*decode_offset(x, linear));
-  const float dt_value = static_cast<float>(*decode_offset(dt, linear)) +
-                         static_cast<float>(*decode_offset(dt_bias, channel));
+  const float x_value =
+      static_cast<float>(*decode_indexed_offset<kCompact>(x, linear));
+  const float dt_value =
+      static_cast<float>(*decode_indexed_offset<kCompact>(dt, linear)) +
+      static_cast<float>(*decode_indexed_offset<kCompact>(dt_bias, channel));
   const float delta = decode_softplusf(dt_value);
-  const float raw_gate = static_cast<float>(*decode_offset(gate, linear));
+  const float raw_gate =
+      static_cast<float>(*decode_indexed_offset<kCompact>(gate, linear));
   const float gate_value =
       raw_gate * __builtin_amdgcn_rcpf(1.0f + decode_expf(-raw_gate));
   const float scaled_input = delta * x_value;
   const float scaled_delta = delta * 1.4426950408889634f;
   float residual = 0.0f;
   if constexpr (kLanes == 4) {
-    residual = static_cast<float>(*decode_offset(d, channel));
+    residual = static_cast<float>(*decode_indexed_offset<kCompact>(d, channel));
   }
   StateVector updated;
   float result = 0.0f;
@@ -361,19 +384,19 @@ __launch_bounds__(kThreads) void mamba_selective_scan_decode_s16_kernel(
 #pragma unroll
   for (int index = 0; index < kStatesPerLane; ++index) {
     const int state_index = lane * kStatesPerLane + index;
-    const float log_value =
-        kAligned
-            ? to_float<T>(log_values.values[index])
-            : to_float<T>(*decode_offset(a_log, channel * 16 + state_index));
+    const float log_value = kAligned
+                                ? to_float<T>(log_values.values[index])
+                                : to_float<T>(*decode_indexed_offset<kCompact>(
+                                      a_log, channel * 16 + state_index));
     const float coefficient = -decode_expf(log_value);
-    const float b_value =
-        kAligned
-            ? to_float<T>(b_values.values[index])
-            : to_float<T>(*decode_offset(b, batch_index * 16 + state_index));
-    const float c_value =
-        kAligned
-            ? to_float<T>(c_values.values[index])
-            : to_float<T>(*decode_offset(c, batch_index * 16 + state_index));
+    const float b_value = kAligned
+                              ? to_float<T>(b_values.values[index])
+                              : to_float<T>(*decode_indexed_offset<kCompact>(
+                                    b, batch_index * 16 + state_index));
+    const float c_value = kAligned
+                              ? to_float<T>(c_values.values[index])
+                              : to_float<T>(*decode_indexed_offset<kCompact>(
+                                    c, batch_index * 16 + state_index));
     const float current = __builtin_amdgcn_exp2f(coefficient * scaled_delta) *
                               previous.values[index] +
                           scaled_input * b_value;
@@ -390,11 +413,11 @@ __launch_bounds__(kThreads) void mamba_selective_scan_decode_s16_kernel(
   }
   // All batches use the same early store, shortening register liveness.
   if constexpr (kAligned)
-    *reinterpret_cast<StateVector *>(decode_offset(state, state_base)) =
-        updated;
+    *reinterpret_cast<StateVector *>(
+        decode_indexed_offset<kCompact>(state, state_base)) = updated;
   else
-    __builtin_memcpy(decode_offset(state, state_base), &updated,
-                     sizeof(StateVector));
+    __builtin_memcpy(decode_indexed_offset<kCompact>(state, state_base),
+                     &updated, sizeof(StateVector));
   if constexpr (kPreserveQuadSum) {
     result += decode_quad<0xb1>(result);
     second_result += decode_quad<0xb1>(second_result);
@@ -407,9 +430,10 @@ __launch_bounds__(kThreads) void mamba_selective_scan_decode_s16_kernel(
   }
   if (lane == 0) {
     if constexpr (kLanes != 4) {
-      residual = static_cast<float>(*decode_offset(d, channel));
+      residual =
+          static_cast<float>(*decode_indexed_offset<kCompact>(d, channel));
     }
-    *decode_offset(out, linear) =
+    *decode_indexed_offset<kCompact>(out, linear) =
         decode_from_float<T>((result + x_value * residual) * gate_value);
   }
 }
@@ -507,10 +531,21 @@ void launch_decode_s16_impl(const MambaScanLayout &p, T *out, const T *x,
                             float *state, cudaStream_t stream) {
   const dim3 blocks(4096 / (kThreads / kLanes),
                     static_cast<unsigned int>(p.batch));
-  mamba_selective_scan_decode_s16_kernel<T, kThreads, kAligned, kLanes,
-                                         kPreserveQuadSum>
-      <<<blocks, kThreads, 0, stream>>>(out, x, dt, b, c, a_log, d, gate,
-                                        dt_bias, state);
+  const auto launch_indexed = [&](auto compact) {
+    constexpr bool kCompact = decltype(compact)::value;
+    mamba_selective_scan_decode_s16_kernel<T, kThreads, kAligned, kLanes,
+                                           kPreserveQuadSum, kCompact>
+        <<<blocks, kThreads, 0, stream>>>(out, x, dt, b, c, a_log, d, gate,
+                                          dt_bias, state);
+  };
+  if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    constexpr size_t kMaxBatch = 2147483647ULL / (4096 * 16 * sizeof(float));
+    if (p.batch <= kMaxBatch) {
+      launch_indexed(std::true_type{});
+      return;
+    }
+  }
+  launch_indexed(std::false_type{});
 }
 
 template <typename T>
@@ -571,57 +606,97 @@ void launch_grouped_scan(const MambaScanLayout &p, T *out, const T *x,
       p, out, x, dt, b, c, a_log, d, gate, dt_bias, state, stream);
 }
 
+// Shape/resource decisions are independent of tensor storage addresses.
+// Alignment remains an invocation-time choice in the family launchers.
+enum class ScanFamily { kDecodeS16, kRegisterS16, kPrefix, kGeneric };
+
+struct ScanLaunchPlan {
+  ScanFamily family;
+  int threads = 0;
+  int items = 0;
+  int waves = 0;
+};
+
+inline ScanLaunchPlan select_scan_plan(const MambaScanLayout &p,
+                                       int compute_units) {
+  const size_t total = p.batch * p.channels;
+  if (p.length == 1 && p.states == 16 && p.channels == 4096 && p.batch <= 65535)
+    return {ScanFamily::kDecodeS16};
+  if (p.states == 16) {
+    if (p.length <= 64) return {ScanFamily::kRegisterS16, 256};
+    // Two independent channel blocks per compute unit hide the recurrence
+    // without paying the affine-prefix overhead.
+    const size_t independent_blocks = (total + 128 / 4 - 1) / (128 / 4);
+    if (independent_blocks >= static_cast<size_t>(compute_units) * 2)
+      return {ScanFamily::kRegisterS16, 128};
+  }
+  if (p.channels % 4 != 0 || p.states > 64) return {ScanFamily::kGeneric, 256};
+  if (p.length <= 64) return {ScanFamily::kPrefix, 0, 1, 4};
+  const size_t block_budget = static_cast<size_t>(compute_units) * 8;
+  if (p.channels % 16 == 0 && total / 16 >= block_budget)
+    return {ScanFamily::kPrefix, 0, 2, 16};
+  if (p.channels % 8 == 0 && total / 8 >= block_budget)
+    return {ScanFamily::kPrefix, 0, 2, 8};
+  return {ScanFamily::kPrefix, 0, 2, 4};
+}
+
+template <typename T, int kThreads>
+void launch_register_s16(const MambaScanLayout &p, T *out, const T *x,
+                         const T *dt, const T *b, const T *c, const T *a_log,
+                         const T *d, const T *gate, const T *dt_bias,
+                         float *state, cudaStream_t stream) {
+  const size_t total = p.batch * p.channels;
+  const dim3 blocks((total + kThreads / 4 - 1) / (kThreads / 4));
+  const bool aligned = (reinterpret_cast<uintptr_t>(state) & 15) == 0 &&
+                       (reinterpret_cast<uintptr_t>(a_log) & 7) == 0 &&
+                       (reinterpret_cast<uintptr_t>(b) & 7) == 0 &&
+                       (reinterpret_cast<uintptr_t>(c) & 7) == 0;
+  if (aligned)
+    mamba_selective_scan_register_s16_kernel<T, true, kThreads>
+        <<<blocks, kThreads, 0, stream>>>(out, x, dt, b, c, a_log, d, gate,
+                                          dt_bias, state, p.batch, p.length,
+                                          p.channels);
+  else
+    mamba_selective_scan_register_s16_kernel<T, false, kThreads>
+        <<<blocks, kThreads, 0, stream>>>(out, x, dt, b, c, a_log, d, gate,
+                                          dt_bias, state, p.batch, p.length,
+                                          p.channels);
+}
+
 template <typename T>
 void launch_scan_dispatch(const MambaScanLayout &p, T *out, const T *x,
                           const T *dt, const T *b, const T *c, const T *a_log,
                           const T *d, const T *gate, const T *dt_bias,
                           float *state, cudaStream_t stream,
                           int compute_units) {
-  const size_t total = p.batch * p.channels;
-  if (p.length == 1 && p.states == 16 && p.channels == 4096 &&
-      p.batch <= 65535) {
-    return launch_decode_s16<T>(p, out, x, dt, b, c, a_log, d, gate, dt_bias,
-                                state, stream, compute_units);
-  }
-  if (p.length <= 64 && p.states == 16) {
-    constexpr int kThreads = 256;
-    const dim3 blocks((total + kThreads / 4 - 1) / (kThreads / 4));
-    const bool aligned = (reinterpret_cast<uintptr_t>(state) & 15) == 0 &&
-                         (reinterpret_cast<uintptr_t>(a_log) & 7) == 0 &&
-                         (reinterpret_cast<uintptr_t>(b) & 7) == 0 &&
-                         (reinterpret_cast<uintptr_t>(c) & 7) == 0;
-    if (aligned)
-      mamba_selective_scan_register_s16_kernel<T, true, kThreads>
-          <<<blocks, kThreads, 0, stream>>>(out, x, dt, b, c, a_log, d, gate,
-                                            dt_bias, state, p.batch, p.length,
-                                            p.channels);
-    else
-      mamba_selective_scan_register_s16_kernel<T, false, kThreads>
-          <<<blocks, kThreads, 0, stream>>>(out, x, dt, b, c, a_log, d, gate,
-                                            dt_bias, state, p.batch, p.length,
-                                            p.channels);
-    return;
-  }
-  // A single register recurrence covers every neighboring length through
-  // one wavefront (64 tokens); there is no 8/16/32-token dispatch cliff.
-  // Multiple length buckets reuse the same prefix family. Long sequences
-  // iterate 128-token tiles inside the GPU kernel with FP32 carry state.
-  if (p.channels % 4 == 0 && p.states <= 64) {
-    if (p.length <= 64)
-      return launch_grouped_scan<T, 1, 4>(p, out, x, dt, b, c, a_log, d, gate,
-                                          dt_bias, state, stream);
-    const size_t block_budget = static_cast<size_t>(compute_units) * 8;
-    if (p.channels % 16 == 0 && total / 16 >= block_budget)
-      return launch_grouped_scan<T, 2, 16>(p, out, x, dt, b, c, a_log, d, gate,
+  const auto plan = select_scan_plan(p, compute_units);
+  switch (plan.family) {
+    case ScanFamily::kDecodeS16:
+      return launch_decode_s16<T>(p, out, x, dt, b, c, a_log, d, gate, dt_bias,
+                                  state, stream, compute_units);
+    case ScanFamily::kRegisterS16:
+      if (plan.threads == 256)
+        return launch_register_s16<T, 256>(p, out, x, dt, b, c, a_log, d, gate,
                                            dt_bias, state, stream);
-    if (p.channels % 8 == 0 && total / 8 >= block_budget)
-      return launch_grouped_scan<T, 2, 8>(p, out, x, dt, b, c, a_log, d, gate,
+      return launch_register_s16<T, 128>(p, out, x, dt, b, c, a_log, d, gate,
+                                         dt_bias, state, stream);
+    case ScanFamily::kPrefix:
+      if (plan.items == 1)
+        return launch_grouped_scan<T, 1, 4>(p, out, x, dt, b, c, a_log, d, gate,
+                                            dt_bias, state, stream);
+      if (plan.waves == 16)
+        return launch_grouped_scan<T, 2, 16>(p, out, x, dt, b, c, a_log, d,
+                                             gate, dt_bias, state, stream);
+      if (plan.waves == 8)
+        return launch_grouped_scan<T, 2, 8>(p, out, x, dt, b, c, a_log, d, gate,
+                                            dt_bias, state, stream);
+      return launch_grouped_scan<T, 2, 4>(p, out, x, dt, b, c, a_log, d, gate,
                                           dt_bias, state, stream);
-    return launch_grouped_scan<T, 2, 4>(p, out, x, dt, b, c, a_log, d, gate,
-                                        dt_bias, state, stream);
+    case ScanFamily::kGeneric:
+      break;
   }
   constexpr unsigned threads = 256;
-  const dim3 blocks((total + threads - 1) / threads);
+  const dim3 blocks((p.batch * p.channels + threads - 1) / threads);
   mamba_selective_scan_kernel<T><<<blocks, threads, 0, stream>>>(
       out, x, dt, b, c, a_log, d, gate, dt_bias, state, p.batch, p.length,
       p.channels, p.states);
