@@ -2,11 +2,13 @@
 #define INFINI_OPS_HYGON_DEEPSEEK_V4_SPARSE_MLA_H_
 
 #include <cuda_runtime.h>
+#include <cstring>
 #include "native/cuda/hygon/flash_mla/bridge.hpp"
 
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 #include "base/deepseek_v4_sparse_mla.h"
 #include "native/cuda/hygon/caster.cuh"
@@ -17,6 +19,7 @@ constexpr size_t kDim = 512;
 constexpr size_t kNope = 448;
 constexpr size_t kValueBytes = 576;
 constexpr unsigned kThreads = 128;
+constexpr size_t kFlashMlaMaxRows = 3072;
 
 struct Pages {
   const uint8_t* data{};
@@ -220,6 +223,11 @@ __global__ void Attend(const T* q, const float* sink, Pages first, Pages second,
   }
 }
 
+#ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
+#include "long_prefill.cuh"
+#include "c4_head_prefill.cuh"
+#endif
+
 }  // namespace v4_sparse_mla_detail
 
 template <>
@@ -267,8 +275,26 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
     if (cudaDeviceGetAttribute(&parallel_queries_, cudaDevAttrMultiProcessorCount, q.device().index()) != cudaSuccess)
       throw std::runtime_error("DeepSeek V4 sparse MLA device query failed");
 #ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
-    vendor_ = q.dtype()==DataType::kBFloat16 && q.size(1)<=64 && q.size(0)<=3072;
-    if (vendor_) workspace_bytes_=hygon_flash_mla::workspace_bytes(q.size(0),parallel_queries_);
+    if (q.dtype() == DataType::kBFloat16 && q.size(1) <= 64) {
+      vendor_ = q.size(0) <= v4_sparse_mla_detail::kFlashMlaMaxRows;
+      if (vendor_) {
+        workspace_bytes_ = hygon_flash_mla::workspace_bytes(q.size(0), parallel_queries_);
+      } else {
+        int wave_size = 0;
+        long_prefill_ = cudaDeviceGetAttribute(&wave_size, cudaDevAttrWarpSize, q.device().index()) ==
+                            cudaSuccess && wave_size == v4_sparse_mla_detail::kLongPrefillWaveSize;
+        if (long_prefill_ && q.size(1) == 8) {
+          cudaDeviceProp properties{};
+          share_prefill_heads_ = cudaGetDeviceProperties(&properties, q.device().index()) == cudaSuccess &&
+                           std::strstr(properties.name, "gfx936") != nullptr;
+          if (share_prefill_heads_) {
+            workspace_bytes_ = v4_sparse_mla_detail::decoded_mla_workspace(
+                swa.size(0), extra ? extra->size(0) : 0,
+                extra ? static_cast<size_t>(extra_page_size) : 0, q.size(0));
+          }
+        }
+      }
+    }
 #endif
   }
 
@@ -313,6 +339,55 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
           static_cast<const T*>(q.data()), static_cast<const float*>(sink.data()),
           first, second, static_cast<T*>(out.data()), q.size(0), q.size(1), static_cast<float>(scale));
       } else {
+#ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
+      if (long_prefill_ && q.size(0) > kFlashMlaMaxRows && q.size(1) <= 64) {
+        if (share_prefill_heads_ && q.size(1) == 8) {
+          const auto stream = static_cast<cudaStream_t>(stream_);
+          const size_t required = decoded_mla_workspace(
+              first.page_count, second.page_count, second.page_tokens, q.size(0));
+          const bool decode = required && workspace_ && workspace_size_in_bytes_ >= required;
+          float* first_decoded = nullptr;
+          float* second_decoded = nullptr;
+          if (decode) {
+            first_decoded = static_cast<float*>(workspace_);
+            second_decoded = first_decoded + first.page_count * first.page_tokens * kDim;
+            const auto prepare = [&](const Pages& table, float* output) {
+              const size_t tokens = table.page_count * table.page_tokens;
+              DecodeMlaPages<<<static_cast<unsigned>(tokens), 256, 0, stream>>>(table, output);
+            };
+            prepare(first, first_decoded);
+            if (second.data) prepare(second, second_decoded);
+          }
+          const size_t groups = blocks / kSharedMlaHeadsPerWave;
+          const size_t grid = (groups + kSharedMlaWavesPerBlock - 1) / kSharedMlaWavesPerBlock;
+          const auto run = [&](auto shift_tag, auto decode_tag) {
+            constexpr unsigned kShift = decltype(shift_tag)::value;
+            constexpr bool kDecode = decltype(decode_tag)::value;
+            AttendLongSharedPrefill<kShift, kDecode><<<static_cast<unsigned>(grid < 65535 ? grid : 65535),
+                kSharedMlaWavesPerBlock * kLongPrefillWaveSize, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data()), static_cast<const float*>(sink.data()),
+                first, second, static_cast<__nv_bfloat16*>(out.data()), q.size(0), q.size(1),
+                static_cast<float>(scale), parallel_queries_, first_decoded, second_decoded);
+          };
+          const auto run_with_pages = [&](auto decode_tag) {
+            if (!second.data) run(std::integral_constant<unsigned, 0>{}, decode_tag);
+            else if (second.page_tokens == 64) run(std::integral_constant<unsigned, 6>{}, decode_tag);
+            else run(std::integral_constant<unsigned, 1>{}, decode_tag);
+          };
+          if (decode) run_with_pages(std::true_type{});
+          else run_with_pages(std::false_type{});
+          return;
+        }
+        const size_t wave_blocks = (blocks + kLongPrefillWaves - 1) / kLongPrefillWaves;
+        AttendLongPrefill<T><<<static_cast<unsigned>(wave_blocks < 65535 ? wave_blocks : 65535),
+                               kLongPrefillWaves * kLongPrefillWaveSize, 0,
+                               static_cast<cudaStream_t>(stream_)>>>(
+            static_cast<const T*>(q.data()), static_cast<const float*>(sink.data()),
+            first, second, static_cast<T*>(out.data()), q.size(0), q.size(1),
+            static_cast<float>(scale), parallel_queries_);
+        return;
+      }
+#endif
       Attend<T><<<static_cast<unsigned>(blocks < 65535 ? blocks : 65535), kThreads, 0,
                   static_cast<cudaStream_t>(stream_)>>>(
           static_cast<const T*>(q.data()), static_cast<const float*>(sink.data()),
@@ -326,6 +401,10 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
  private:
   int parallel_queries_{};
   bool vendor_{};
+#ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
+  bool long_prefill_{};
+  bool share_prefill_heads_{};
+#endif
   size_t workspace_bytes_{};
 };
 

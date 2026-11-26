@@ -12,6 +12,13 @@
 namespace infini::ops {
 namespace v4_store_mla_detail {
 
+static __device__ __forceinline__ uint8_t EncodeScale(float max_abs) {
+  const float raw_scale = fmaxf(max_abs, 1e-4f) / 224.0f;
+  const uint32_t bits = __float_as_uint(raw_scale);
+  return static_cast<uint8_t>(min(int((bits >> 23) & 255) + int((bits & 0x7fffff) != 0), 254));
+}
+
+
 template <class T>
 static __global__ void Store(const T* kv, const int32_t* slots, uint8_t* pages,
                       size_t rows, size_t page_count, size_t page_stride, size_t page_tokens) {
@@ -41,11 +48,8 @@ static __global__ void Store(const T* kv, const int32_t* slots, uint8_t* pages,
     }
     if (lane < 7) {
       // Match the HCU FlashMLA writer's conservative E4M3 scale range.
-      const float raw_scale = fmaxf(max_abs[lane][0], 1e-4f) / 224.0f;
-      const uint32_t bits = __float_as_uint(raw_scale);
-      const int encoded = min(int((bits >> 23) & 255) + int((bits & 0x7fffff) != 0), 254);
-      exponents[lane] = static_cast<uint8_t>(encoded);
-      inverse_scale[lane] = exp2f(127.0f - encoded);
+      exponents[lane] = EncodeScale(max_abs[lane][0]);
+      inverse_scale[lane] = exp2f(127.0f - exponents[lane]);
     }
     __syncthreads();
     const auto offset = static_cast<size_t>(id) % page_tokens;

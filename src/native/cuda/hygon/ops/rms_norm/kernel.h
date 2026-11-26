@@ -3,6 +3,8 @@
 
 #include "native/cuda/hygon/caster.cuh"
 #include "native/cuda/hygon/runtime_.h"
+#include "native/cuda/hygon/ops/rms_norm/head_reduce.cuh"
+#include "native/cuda/hygon/ops/rms_norm/kv_reduce.cuh"
 #include "native/cuda/ops/rms_norm/kernel.h"
 
 namespace infini::ops {
@@ -20,19 +22,7 @@ static __global__ void NormHeads(const float* input, const float* weight,
   if (row >= rows) return;
   input += row * input_row_stride + (head % heads) * input_head_stride;
   output += row * output_row_stride + (head % heads) * output_head_stride;
-  float squared_sum = 0.0f;
-#pragma unroll
-  for (unsigned tile = 0; tile < 2; ++tile) {
-#pragma unroll
-    for (unsigned element = 0; element < 8; ++element) {
-      const float x = input[tile * 256 + lane * 8 + element];
-      squared_sum = __fmaf_rn(x, x, squared_sum);
-    }
-  }
-#pragma unroll
-  for (unsigned offset = 16; offset; offset >>= 1)
-    squared_sum += __shfl_xor_sync(0xffffffff, squared_sum, offset, 32);
-  const float inverse_rms = rsqrtf(squared_sum / 512.0f + epsilon);
+  const float inverse_rms = HeadInverseRms(input, epsilon);
   for (unsigned i = lane; i < 512; i += 32)
     output[i] = __fmul_rn(__fmul_rn(input[i], inverse_rms), weight[i]);
 }
@@ -40,25 +30,10 @@ static __global__ void NormKv(const float* input, const float* weight,
                              float* output, int64_t input_stride,
                              int64_t output_stride, float epsilon) {
   __shared__ float partial[8];
-  const unsigned thread = threadIdx.x, lane = thread % 32;
+  const unsigned thread = threadIdx.x;
   input += blockIdx.x * input_stride;
   output += blockIdx.x * output_stride;
-  float sum = 0.0f;
-#pragma unroll
-  for (unsigned j=0;j<2;++j) {
-    const float x=input[2*thread+j];
-    sum=__fmaf_rn(x,x,sum);
-  }
-#pragma unroll
-  for (unsigned offset=16;offset;offset>>=1)
-    sum+=__shfl_xor_sync(0xffffffff,sum,offset,32);
-  if (!lane) partial[thread/32]=sum;
-  __syncthreads();
-  sum=partial[lane%8];
-#pragma unroll
-  for (unsigned offset=4;offset;offset>>=1)
-    sum+=__shfl_xor_sync(0xffffffff,sum,offset,8);
-  const float inverse_rms=rsqrtf(sum/512.0f+epsilon);
+  const float inverse_rms = KvInverseRms(input[2*thread], input[2*thread+1], epsilon, partial);
 #pragma unroll
   for (unsigned j=0;j<2;++j) {
     const unsigned i=2*thread+j;

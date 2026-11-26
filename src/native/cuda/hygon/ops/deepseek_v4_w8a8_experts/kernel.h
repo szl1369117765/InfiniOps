@@ -6,9 +6,11 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 #include "base/deepseek_v4_w8a8_experts.h"
 #include "kernel_v2.cuh"
+#include "grouped.cuh"
 #include "math.cuh"
 #include "native/cuda/hygon/dynamic_int8_quant.cuh"
 
@@ -187,7 +189,11 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
                   limit, routed_scale, out))
       throw std::invalid_argument(
           "DeepSeek V4 W8A8 expert input is unsupported");
-    workspace_bytes_ = workspace_bytes(x, weights, down.size(2));
+    grouped_ = x.dtype() == DataType::kBFloat16 &&
+        expert_grouped::supported(x.size(0), down.size(0), x.size(1), down.size(2),
+                                  weights.size(1), routed_scale.has_value()) &&
+        expert_grouped::available(x.device().index());
+    workspace_bytes_ = workspace_bytes(x, weights, down);
   }
 
   std::size_t workspace_size_in_bytes() const override {
@@ -202,7 +208,7 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
                   Tensor out) const override {
     if (!supports(x, weights, indices, gate_up, gate_up_scale, down, down_scale,
                   limit, routed_scale, out) ||
-        workspace_bytes(x, weights, down.size(2)) != workspace_bytes_ ||
+        workspace_bytes(x, weights, down) != workspace_bytes_ ||
         workspace_size_in_bytes_ < workspace_bytes_ || !workspace_)
       throw std::invalid_argument(
           "DeepSeek V4 W8A8 expert inputs or workspace changed");
@@ -220,12 +226,13 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
   static constexpr size_t kMaxDotWidth =
       std::numeric_limits<int32_t>::max() / (127 * 128);
   size_t workspace_bytes_{};
+  bool grouped_{};
 
-  static size_t workspace_bytes(const Tensor x, const Tensor weights,
-                                size_t inner) {
-    const size_t tokens = x.size(0), routes = weights.numel();
-    return (routes * inner + tokens + routes) * sizeof(float) +
-           tokens * x.size(1) + routes * inner;
+  size_t workspace_bytes(const Tensor x, const Tensor weights, const Tensor down) const {
+    const size_t tokens = x.size(0), routes = weights.numel(), inner = down.size(2);
+    const size_t bytes = (routes * inner + tokens + routes) * sizeof(float) +
+                         tokens * x.size(1) + routes * inner;
+    return grouped_ ? bytes + 7 + expert_grouped::workspace_bytes(routes, down.size(0)) : bytes;
   }
 
   template <class T>
@@ -243,6 +250,25 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
     auto* activation_scale = input_scale + tokens;
     auto* q_input = reinterpret_cast<int8_t*>(activation_scale + routes);
     auto* q_activated = q_input + tokens * hidden;
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      if (grouped_ &&
+          expert_grouped::supported(tokens, down.size(0), hidden, inner,
+                                     weights.size(1), routed_scale.has_value()) &&
+          ((reinterpret_cast<uintptr_t>(gate_up.data()) |
+            reinterpret_cast<uintptr_t>(down.data())) & 7u) == 0) {
+        q_input = reinterpret_cast<int8_t*>((reinterpret_cast<uintptr_t>(q_input) + 7) & ~uintptr_t{7});
+        q_activated = q_input + tokens * hidden;
+        const auto plan = expert_grouped::workspace(q_activated + routes * inner, routes, down.size(0));
+        expert_grouped::run(stream, static_cast<const T*>(x.data()), ids,
+            static_cast<const float*>(weights.data()), static_cast<const int8_t*>(gate_up.data()),
+            static_cast<const float*>(gate_up_scale.data()), static_cast<const int8_t*>(down.data()),
+            static_cast<const float*>(down_scale.data()), static_cast<T*>(out.data()),
+            activated, input_scale, activation_scale, q_input, q_activated, plan,
+            tokens, weights.size(1), down.size(0), hidden, inner, static_cast<float>(limit),
+            routed_scale.has_value(), static_cast<float>(routed_scale.value_or(1.0)));
+        return;
+      }
+    }
     const auto grid = [](size_t rows) {
       return static_cast<unsigned>(rows < 65535 ? rows : 65535);
     };

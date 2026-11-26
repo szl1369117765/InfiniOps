@@ -4,7 +4,9 @@
 #include "base/deepseek_v4_mhc_pre.h"
 #include "head.cuh"
 #include "decoder_projection.cuh"
+#include "prefill_projection.cuh"
 #include "decoder_mix.cuh"
+#include "decode_single_token.cuh"
 #include <cstdint>
 
 namespace infini::ops {
@@ -233,6 +235,7 @@ class Operator<DeepseekV4MhcPre,Device::Type::kHygon> : public DeepseekV4MhcPre 
     // Only the measured Flash decoder shape opts in. Keep the head and other
     // hidden widths on their established paths.
     const bool flash_decoder = it > 0 && x.size(2) == 4096;
+    const bool single_token_decoder = flash_decoder && rows == 1;
     if (use_split_projection(rows,x.size(2),it)) {
       squares = v + rows*kSplits*kWidth;
       const dim3 split_grid((rows+15)/16,2,kSplits);
@@ -241,7 +244,12 @@ class Operator<DeepseekV4MhcPre,Device::Type::kHygon> : public DeepseekV4MhcPre 
         // scalar loads rather than assuming vector alignment.
         const bool aligned = (reinterpret_cast<uintptr_t>(residual) & 3u) == 0
                           && (reinterpret_cast<uintptr_t>(weight) & 7u) == 0;
-        if (aligned) {
+        const bool decode_aligned =
+            reinterpret_cast<uintptr_t>(residual) % alignof(uint2) == 0 &&
+            reinterpret_cast<uintptr_t>(weight) % alignof(v4_mhc_opt::Float4) == 0;
+        if (single_token_decoder && decode_aligned) {
+          v4_mhc_opt::project_decode<<<split_grid,64,0,stream>>>(residual,weight,v,squares);
+        } else if (aligned) {
           if (rows > 64) v4_mhc_opt::project_split<true,true><<<split_grid,64,0,stream>>>(residual,weight,v,squares,rows,width);
           else v4_mhc_opt::project_split<false,true><<<split_grid,64,0,stream>>>(residual,weight,v,squares,rows,width);
         } else {
@@ -252,13 +260,24 @@ class Operator<DeepseekV4MhcPre,Device::Type::kHygon> : public DeepseekV4MhcPre 
         if (rows > 64) project_split<true><<<split_grid,64,0,stream>>>(residual,weight,v,squares,rows,width);
         else project_split<false><<<split_grid,64,0,stream>>>(residual,weight,v,squares,rows,width);
       }
+    } else if (flash_decoder && rows <= 65535 &&
+               reinterpret_cast<uintptr_t>(residual) % alignof(unsigned) == 0 &&
+               reinterpret_cast<uintptr_t>(weight) % alignof(v4_mhc_opt::Float2) == 0) {
+      constexpr auto tile_rows = v4_mhc_opt::PrefillTileRows;
+      const dim3 tiles((rows + tile_rows - 1) / tile_rows, kWidth / v4_mhc_opt::PrefillTileColumns);
+      v4_mhc_opt::project_prefill<<<tiles,64,0,stream>>>(residual,weight,v,rows,float(e));
     } else if (flash_decoder) {
       v4_mhc_opt::project_tiled<<<dim3(grid(rows),6),128,0,stream>>>(residual,weight,v,rows,width,w.size(0),float(e));
     } else {
       project<<<grid(rows*w.size(0)),kThreads,0,stream>>>(residual,weight,v,rows,width,w.size(0),float(e));
     }
     if(cudaGetLastError()!=cudaSuccess) throw std::runtime_error("DeepSeek V4 mHC projection launch failed");
-    if (flash_decoder) {
+    if (single_token_decoder) {
+      v4_mhc_opt::mix_decode<<<1 + v4_mhc_opt::DecodeCollapseBlocks,128,0,stream>>>(
+          residual,v,static_cast<const float*>(s.data()),static_cast<const float*>(b.data()),
+          static_cast<__nv_bfloat16*>(y.data()),static_cast<float*>(p.data()),
+          static_cast<float*>(c.data()),float(m),it,squares,float(e));
+    } else if (flash_decoder) {
       if (squares) v4_mhc_opt::mix_parallel<true><<<grid(rows),128,0,stream>>>(residual,v,static_cast<const float*>(s.data()),
           static_cast<const float*>(b.data()),static_cast<__nv_bfloat16*>(y.data()),
           static_cast<float*>(p.data()),static_cast<float*>(c.data()),rows,x.size(2),float(m),it,squares,float(e));
