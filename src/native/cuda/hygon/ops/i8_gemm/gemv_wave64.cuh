@@ -9,11 +9,10 @@
 namespace infini::ops::hygon_i8_gemm {
 
 template <int K, typename Tdata>
-__global__ __launch_bounds__(512) void gemv_i8_hygon(Tdata *__restrict__ y, const Tdata *bias,
-                              const int8_t *__restrict__ x,
-                              const float *x_scale,
-                              const int8_t *__restrict__ w,
-                              const float *w_scale, int n, ptrdiff_t bias_col) {
+__global__ __launch_bounds__(512) void gemv_i8_hygon(
+    Tdata* __restrict__ y, const Tdata* bias, const int8_t* __restrict__ x,
+    const float* x_scale, const int8_t* __restrict__ w, const float* w_scale,
+    int n, ptrdiff_t bias_col) {
   const int lane = threadIdx.x & 63;
   const int col = blockIdx.x * (blockDim.x / 64) + threadIdx.x / 64;
   if (col >= n) return;
@@ -41,12 +40,10 @@ __global__ __launch_bounds__(512) void gemv_i8_hygon(Tdata *__restrict__ y, cons
 // Aligned 16-byte loads reduce load instructions for the measured BW decode
 // shape.
 template <int K, typename Tdata>
-__global__ __launch_bounds__(512) void gemv_vector_hygon(Tdata *__restrict__ y, const Tdata *bias,
-                                  const int8_t *__restrict__ x,
-                                  const float *x_scale,
-                                  const int8_t *__restrict__ w,
-                                  const float *w_scale, int n,
-                                  ptrdiff_t bias_col) {
+__global__ __launch_bounds__(512) void gemv_vector_hygon(
+    Tdata* __restrict__ y, const Tdata* bias, const int8_t* __restrict__ x,
+    const float* x_scale, const int8_t* __restrict__ w, const float* w_scale,
+    int n, ptrdiff_t bias_col) {
   const int lane = threadIdx.x & 63;
   const int col = blockIdx.x * (blockDim.x / 64) + threadIdx.x / 64;
   if (col >= n) return;

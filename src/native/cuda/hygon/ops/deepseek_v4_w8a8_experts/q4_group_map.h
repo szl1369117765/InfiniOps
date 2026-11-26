@@ -16,8 +16,9 @@ struct Q4ExpertGroup {
 // Duplicate IDs in the same token remain distinct slots. Group the n-th
 // occurrence in each token and assign ownership to its first slot.
 template <unsigned TopK>
-__host__ __device__ inline Q4ExpertGroup FindQ4ExpertGroup(
-    const int64_t* ids, unsigned slot, size_t experts) {
+__host__ __device__ inline Q4ExpertGroup FindQ4ExpertGroup(const int64_t* ids,
+                                                           unsigned slot,
+                                                           size_t experts) {
   const auto expert = ids[slot];
   Q4ExpertGroup group;
   if (expert < 0 || static_cast<size_t>(expert) >= experts) return group;

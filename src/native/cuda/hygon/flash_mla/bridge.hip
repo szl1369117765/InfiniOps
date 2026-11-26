@@ -61,30 +61,46 @@ struct Schedule {
 };
 
 Schedule schedule_view(const void* storage, int rows, int partitions) {
-  static_assert(sizeof(DecodingSchedMeta) == 32 && alignof(DecodingSchedMeta) == 32);
+  static_assert(sizeof(DecodingSchedMeta) == 32 &&
+                alignof(DecodingSchedMeta) == 32);
   static_assert(31 + sizeof(DecodingSchedMeta) * kMaxSchedulePartitions +
-                sizeof(int) * (kMaxScheduleRows + 1) <= kScheduleStorageBytes);
-  if (!storage || rows <= 0 || rows > kMaxScheduleRows ||
-      partitions <= 0 || partitions > kMaxSchedulePartitions)
-    throw std::invalid_argument("Unsupported FlashMLA shared schedule geometry");
-  const auto address = (reinterpret_cast<uintptr_t>(storage) + 31) & ~uintptr_t(31);
+                    sizeof(int) * (kMaxScheduleRows + 1) <=
+                kScheduleStorageBytes);
+  if (!storage || rows <= 0 || rows > kMaxScheduleRows || partitions <= 0 ||
+      partitions > kMaxSchedulePartitions)
+    throw std::invalid_argument(
+        "Unsupported FlashMLA shared schedule geometry");
+  const auto address =
+      (reinterpret_cast<uintptr_t>(storage) + 31) & ~uintptr_t(31);
   auto* metadata = reinterpret_cast<DecodingSchedMeta*>(address);
-  auto* splits = reinterpret_cast<int*>(address + sizeof(DecodingSchedMeta) * partitions);
+  auto* splits =
+      reinterpret_cast<int*>(address + sizeof(DecodingSchedMeta) * partitions);
   return {metadata, splits};
 }
 
 void launch_schedule(int rows, int partitions, int swa_width, int extra_width,
                      const int32_t* swa_lengths, const int32_t* extra_lengths,
                      Schedule schedule, hipStream_t stream) {
-  GetDecodeSchedMetaParams scheduler{rows, 1, 64, 5, swa_width, extra_width,
-      const_cast<int32_t*>(swa_lengths), const_cast<int32_t*>(extra_lengths), nullptr,
-      schedule.metadata, schedule.splits, partitions, stream};
+  GetDecodeSchedMetaParams scheduler{rows,
+                                     1,
+                                     64,
+                                     5,
+                                     swa_width,
+                                     extra_width,
+                                     const_cast<int32_t*>(swa_lengths),
+                                     const_cast<int32_t*>(extra_lengths),
+                                     nullptr,
+                                     schedule.metadata,
+                                     schedule.splits,
+                                     partitions,
+                                     stream};
   gfx9::decode::run_get_decoding_sched_meta_kernel(scheduler);
 }
 
 void run_impl(const Arguments& a, const void* prepared_schedule) {
-  const auto required = prepared_schedule ? scheduled_workspace_bytes(a.rows, a.partitions)
-                                          : workspace_bytes(a.rows, a.partitions);
+  const auto required = prepared_schedule
+                            ? scheduled_workspace_bytes(a.rows, a.partitions)
+                            : workspace_bytes(a.rows, a.partitions);
   if (!a.workspace || a.workspace_bytes < required)
     throw std::invalid_argument("FlashMLA workspace is too small");
   Workspace work(a.workspace);
@@ -96,9 +112,10 @@ void run_impl(const Arguments& a, const void* prepared_schedule) {
   auto* lse = work.take<float>(query_count);
   auto* lse_accum = work.take<float>(split_count);
   auto* out_accum = work.take<float>(split_count * kDimension);
-  const Schedule schedule = prepared_schedule
-      ? schedule_view(prepared_schedule, a.rows, a.partitions)
-      : Schedule{work.take<DecodingSchedMeta>(a.partitions), work.take<int>(a.rows + 1)};
+  const Schedule schedule =
+      prepared_schedule ? schedule_view(prepared_schedule, a.rows, a.partitions)
+                        : Schedule{work.take<DecodingSchedMeta>(a.partitions),
+                                   work.take<int>(a.rows + 1)};
   const auto stream = static_cast<hipStream_t>(a.stream);
   const unsigned grid = std::min<size_t>((query_count * kDimension + 255) / 256, 65535);
   pad_input<<<grid,256,0,stream>>>(static_cast<const uint16_t*>(a.query),a.sink,
@@ -149,8 +166,8 @@ void run_impl(const Arguments& a, const void* prepared_schedule) {
   p.stride_extra_indices_s_q=a.extra.index_width;
   p.stream=stream;
   p.num_sm_parts=a.partitions;
-  p.tile_scheduler_metadata_ptr=schedule.metadata;
-  p.num_splits_ptr=schedule.splits;
+  p.tile_scheduler_metadata_ptr = schedule.metadata;
+  p.num_splits_ptr = schedule.splits;
   p.lse_accum=lse_accum;
   p.o_accum=out_accum;
   p.stride_lse_accum_split=kHeads;
@@ -159,8 +176,9 @@ void run_impl(const Arguments& a, const void* prepared_schedule) {
   p.stride_o_accum_s_q=kHeads*kDimension;
   p.stride_o_accum_h_q=kDimension;
   if (!prepared_schedule) {
-    launch_schedule(a.rows, a.partitions, a.swa.index_width, a.extra.index_width,
-                    a.swa.lengths, a.extra.lengths, schedule, stream);
+    launch_schedule(a.rows, a.partitions, a.swa.index_width,
+                    a.extra.index_width, a.swa.lengths, a.extra.lengths,
+                    schedule, stream);
   }
   gfx93::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1,kHeads>(p);
 
@@ -183,8 +201,8 @@ void run_impl(const Arguments& a, const void* prepared_schedule) {
   combine.stride_o_accum_split=kHeads*kDimension;
   combine.stride_o_accum_s_q=kHeads*kDimension;
   combine.stride_o_accum_h_q=kDimension;
-  combine.tile_scheduler_metadata_ptr=schedule.metadata;
-  combine.num_splits_ptr=schedule.splits;
+  combine.tile_scheduler_metadata_ptr = schedule.metadata;
+  combine.num_splits_ptr = schedule.splits;
   combine.num_sm_parts=a.partitions;
   combine.attn_sink=sink;
   combine.stream=stream;
@@ -195,19 +213,19 @@ void run_impl(const Arguments& a, const void* prepared_schedule) {
 }
 }  // namespace
 
-void run(const Arguments& a) {
-  run_impl(a, nullptr);
-}
+void run(const Arguments& a) { run_impl(a, nullptr); }
 
 void prepare_schedule(int rows, int partitions, int swa_width, int extra_width,
                       const int32_t* swa_lengths, const int32_t* extra_lengths,
                       void* schedule, void* stream) {
-  launch_schedule(rows, partitions, swa_width, extra_width, swa_lengths, extra_lengths,
-                  schedule_view(schedule, rows, partitions), static_cast<hipStream_t>(stream));
+  launch_schedule(rows, partitions, swa_width, extra_width, swa_lengths,
+                  extra_lengths, schedule_view(schedule, rows, partitions),
+                  static_cast<hipStream_t>(stream));
 }
 
 void run_with_schedule(const Arguments& a, const void* schedule) {
-  if (!schedule) throw std::invalid_argument("FlashMLA shared schedule is missing");
+  if (!schedule)
+    throw std::invalid_argument("FlashMLA shared schedule is missing");
   run_impl(a, schedule);
 }
 
