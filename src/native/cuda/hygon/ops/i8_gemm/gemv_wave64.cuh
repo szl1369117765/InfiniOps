@@ -12,7 +12,7 @@ template <int K, typename Tdata>
 __global__ __launch_bounds__(512) void gemv_i8_hygon(
     Tdata* __restrict__ y, const Tdata* bias, const int8_t* __restrict__ x,
     const float* x_scale, const int8_t* __restrict__ w, const float* w_scale,
-    int n, ptrdiff_t bias_col) {
+    int n, ptrdiff_t bias_col, bool activation_scale_first = false) {
   const int lane = threadIdx.x & 63;
   const int col = blockIdx.x * (blockDim.x / 64) + threadIdx.x / 64;
   if (col >= n) return;
@@ -29,8 +29,10 @@ __global__ __launch_bounds__(512) void gemv_i8_hygon(
   for (int offset = 32; offset > 0; offset >>= 1)
     sum += __shfl_down_sync(0xffffffffffffffffull, sum, offset, 64);
   if (lane == 0) {
-    const float scale = __fmul_rn(x_scale[0], w_scale[col]);
-    float output = __fmul_rn(scale, static_cast<float>(sum));
+    const float dot = static_cast<float>(sum);
+    float output = activation_scale_first
+        ? __fmul_rn(__fmul_rn(dot, x_scale[0]), w_scale[col])
+        : __fmul_rn(__fmul_rn(x_scale[0], w_scale[col]), dot);
     if (bias != nullptr)
       output += Caster<Device::Type::kHygon>::template Cast<float>(
           bias[col * bias_col]);

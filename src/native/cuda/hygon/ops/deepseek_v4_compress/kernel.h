@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdlib>
+#include <string_view>
 
 #include "base/deepseek_v4_compress.h"
 #include "native/cuda/hygon/caster.cuh"
@@ -45,7 +46,7 @@ template<class T>
 static __global__ void Pool(const T* projection, const float* ape,
                             const int32_t* sources, const float* state, T* out,
                             size_t input_rows, size_t state_rows, size_t output_rows,
-                            size_t head_dim, size_t window, bool checkpoint_ape) {
+                            size_t head_dim, size_t window, bool checkpoint_ape, bool exact_exp) {
   using Convert = Caster<Device::Type::kHygon>;
   const size_t width = (window == 8 ? 4 : 2) * head_dim;
   for (size_t row = blockIdx.x; row < output_rows; row += gridDim.x) {
@@ -72,7 +73,9 @@ static __global__ void Pool(const T* projection, const float* ape,
           if (group_max != -INFINITY) {
             for (size_t i = 0; i < 8; ++i) {
               if (scores[i] == -INFINITY) continue;
-              const float weight = FastExp(scores[i] - group_max);
+              const float delta = scores[i] - group_max;
+              const float weight = exact_exp && window == 8 && head_dim == 512
+                  ? expf(delta) : FastExp(delta);
               group_product = fmaf(values[i], weight, group_product);
               group_sum += weight;
             }
@@ -264,11 +267,14 @@ class Operator<DeepseekV4Compress, Device::Type::kHygon> : public DeepseekV4Comp
           }
         }
         if (!use_short_c128) {
+          const char* exact = std::getenv("INFINIOPS_DSV4_C4_EXACT_EXP");
+          const std::string_view mode = exact ? exact : "";
+          const bool exact_exp = mode == "1" || (mode == "decode" && projection.size(0) == 1);
           Pool<T><<<grid(out.size(0)), 128, 0, stream>>>(
               data, static_cast<const float*>(ape.data()),
               static_cast<const int32_t*>(sources.data()), state_data,
               static_cast<T*>(out.data()), projection.size(0), state.size(0),
-              out.size(0), out.size(1), sources.size(1), ape.size(0) == 4);
+              out.size(0), out.size(1), sources.size(1), ape.size(0) == 4, exact_exp);
         }
         if (cudaGetLastError() != cudaSuccess)
           throw std::runtime_error("DeepSeek V4 pooling launch failed");

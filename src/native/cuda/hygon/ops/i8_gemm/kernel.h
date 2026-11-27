@@ -62,7 +62,7 @@ template <class T>
 __global__ void matmul(T* out, const int8_t* a, const float* as,
                        const int8_t* b, const float* bs, const T* bias,
                        size_t m, size_t n, size_t k, ptrdiff_t bias_row,
-                       ptrdiff_t bias_col) {
+                       ptrdiff_t bias_col, bool activation_scale_first = false) {
   __shared__ int32_t partial[128];
   for (size_t idx = blockIdx.x; idx < m * n; idx += gridDim.x) {
     const size_t row = idx / n, col = idx % n;
@@ -79,7 +79,9 @@ __global__ void matmul(T* out, const int8_t* a, const float* as,
     if (threadIdx.x == 0) {
       using Convert = Caster<Device::Type::kHygon>;
       // The W8A8 epilogue rounds the joint scale before applying it to the dot.
-      float value = ScaleDot(partial[0], as[row], bs[col]);
+      const float dot = static_cast<float>(partial[0]);
+      float value = activation_scale_first ? __fmul_rn(__fmul_rn(dot, as[row]), bs[col])
+                                           : ScaleDot(partial[0], as[row], bs[col]);
       if (bias)
         value += Convert::template Cast<float>(
             bias[row * bias_row + col * bias_col]);
@@ -157,6 +159,49 @@ static __device__ __forceinline__ void ProjectionQ4Tile(
       const float scale = __fmul_rn(as[row], bs[col]);
       const float value = __fmul_rn(static_cast<float>(dot[row]), scale);
       out[row * kProjectionColumns + col] = Convert::template Cast<__nv_bfloat16>(value);
+    }
+  }
+}
+
+// Keep the same INT32 dot and BF16 epilogue as the scalar path while
+// loading each INT8 weight fragment for up to four adjacent input rows.
+template <unsigned K>
+static __global__ void matmul_decode_batch(
+    __nv_bfloat16* out, const int8_t* a, const float* as, const int8_t* b,
+    const float* bs, unsigned rows, unsigned columns) {
+  constexpr unsigned tile_rows = 4;
+  const unsigned lane = threadIdx.x % kWave;
+  const unsigned col = blockIdx.x * kWavesPerBlock + threadIdx.x / kWave;
+  if (col >= columns) return;
+  const unsigned first = blockIdx.y * tile_rows;
+  const unsigned count = min(rows - first, tile_rows);
+  const int8_t* weight = b + size_t(col) * K;
+  int32_t dots[tile_rows] = {};
+#pragma unroll
+  for (unsigned k = lane * 4; k < K; k += kWave * 4) {
+    const auto packed_weight = LoadProjectionInt8x4(weight + k);
+#pragma unroll
+    for (unsigned row = 0; row < tile_rows; ++row) {
+      if (row < count) {
+        const auto input = LoadProjectionInt8x4(a + size_t(first + row) * K + k);
+        dots[row] = ProjectionDot4(input, packed_weight, dots[row]);
+      }
+    }
+  }
+#pragma unroll
+  for (unsigned offset = kWave / 2; offset; offset /= 2) {
+#pragma unroll
+    for (unsigned row = 0; row < tile_rows; ++row)
+      dots[row] += __shfl_down(dots[row], offset, kWave);
+  }
+  if (lane == 0) {
+    using Convert = Caster<Device::Type::kHygon>;
+#pragma unroll
+    for (unsigned row = 0; row < tile_rows; ++row) {
+      if (row < count) {
+        const auto value = ScaleDot(dots[row], as[first + row], bs[col]);
+        out[size_t(first + row) * columns + col] = Convert::template Cast<__nv_bfloat16>(value);
+      }
     }
   }
 }
@@ -274,6 +319,23 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
     auto launch = [&](auto tag) {
       using T = decltype(tag);
       if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        const auto width = c.size(1);
+        const char* exact = nullptr;
+        if (width == 1024) exact = std::getenv("INFINIOPS_DSV4_WQA_SCALE_FIRST");
+        if (width == 512) exact = std::getenv("INFINIOPS_DSV4_WKV_PREFILL_SCALE_FIRST");
+        if (!bias && exact && exact[0] == '1' && exact[1] == '\0' &&
+            a.size(0) > 4 && a.size(0) <= 16 && a.size(1) == 4096) {
+          hygon_i8_gemm::matmul<T>
+              <<<static_cast<unsigned>(c.numel()), 128, 0, static_cast<cudaStream_t>(stream_)>>>(
+                  static_cast<T*>(c.data()), static_cast<const int8_t*>(a.data()),
+                  static_cast<const float*>(as.data()), static_cast<const int8_t*>(b.data()),
+                  static_cast<const float*>(bs.data()), nullptr, c.size(0), c.size(1),
+                  a.size(1), 0, 0, true);
+          return;
+        }
+      }
+
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
         using namespace hygon_i8_gemm;
         const bool m12 = c.size(0) == kProjectionM12Rows;
         if (!bias && (c.size(0) == kProjectionRows || m12) && c.size(1) == kProjectionColumns &&
@@ -303,6 +365,28 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
           }
         }
       }
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        using namespace hygon_i8_gemm;
+        const char* setting = std::getenv("INFINIOPS_DSV4_I8_DECODE_TILE");
+        if (!bias && setting && setting[0] == '1' && setting[1] == '\0' &&
+            a.size(0) >= 2 && a.size(0) <= 16 && c.size(1) <= 16384 &&
+            (a.size(1) == 1024 || a.size(1) == 4096) &&
+            (reinterpret_cast<std::uintptr_t>(a.data()) & 3u) == 0 &&
+            (reinterpret_cast<std::uintptr_t>(b.data()) & 3u) == 0) {
+          const unsigned rows = a.size(0), columns = c.size(1);
+          const dim3 grid((columns + kWavesPerBlock - 1) / kWavesPerBlock, (rows + 3) / 4);
+          const auto stream = static_cast<cudaStream_t>(stream_);
+          const auto run = [&](auto width) {
+            matmul_decode_batch<decltype(width)::value><<<grid, kWave * kWavesPerBlock, 0, stream>>>(
+                static_cast<T*>(c.data()), static_cast<const int8_t*>(a.data()),
+                static_cast<const float*>(as.data()), static_cast<const int8_t*>(b.data()),
+                static_cast<const float*>(bs.data()), rows, columns);
+          };
+          if (a.size(1) == 1024) run(std::integral_constant<unsigned, 1024>{});
+          else run(std::integral_constant<unsigned, 4096>{});
+          return;
+        }
+      }
       if (a.size(0) == 1 && (a.size(1) == 1024 || a.size(1) == 4096) &&
           c.size(1) <= INT32_MAX - 8 &&
           (reinterpret_cast<uintptr_t>(a.data()) & 3u) == 0 &&
@@ -324,6 +408,16 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
                     static_cast<const float*>(bs.data()), n,
                     bias ? bias->stride(1) : 0);
           } else {
+            const char* exact = nullptr;
+            if (std::is_same_v<T, __nv_bfloat16> && !bias && k == 4096) {
+              if (n == 1024) {
+                exact = std::getenv("INFINIOPS_DSV4_WQA_DECODE_SCALE_FIRST");
+              } else if (n == 512) {
+                exact = std::getenv("INFINIOPS_DSV4_WKV_DECODE_SCALE_FIRST");
+              }
+            }
+            const bool activation_scale_first = exact &&
+                exact[0] == '1' && exact[1] == '\0';
             hygon_i8_gemm::gemv_i8_hygon<k, T>
                 <<<blocks, threads, 0, static_cast<cudaStream_t>(stream_)>>>(
                     static_cast<T*>(c.data()),
@@ -332,7 +426,7 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
                     static_cast<const float*>(as.data()),
                     static_cast<const int8_t*>(b.data()),
                     static_cast<const float*>(bs.data()), n,
-                    bias ? bias->stride(1) : 0);
+                    bias ? bias->stride(1) : 0, activation_scale_first);
           }
         };
         if (a.size(1) == 1024) {

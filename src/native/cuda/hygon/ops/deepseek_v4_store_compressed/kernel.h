@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -14,7 +15,31 @@
 namespace infini::ops {
 namespace v4_store_compressed_detail {
 
-template <unsigned BlockSize, typename Position>
+// The mirror assigns two adjacent FP32 inputs to each thread and reduces
+// eight logical warp-32 partials. Only thread zero consumes the block sum.
+static __device__ __forceinline__ float PairwiseSumSquared(const float* pooled) {
+  const unsigned thread = threadIdx.x;
+  const unsigned lane = thread % 32;
+  const float a = pooled[thread * 2];
+  const float b = pooled[thread * 2 + 1];
+  float sum = __fmaf_rn(b, b, __fmul_rn(a, a));
+#pragma unroll
+  for (unsigned delta = 16; delta > 0; delta >>= 1) {
+    sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, delta, 32));
+  }
+  __shared__ float warp_sums[8];
+  if (lane == 0) warp_sums[thread / 32] = sum;
+  __syncthreads();
+  if (thread != 0) return 0.0f;
+
+  const float even = __fadd_rn(__fadd_rn(warp_sums[0], warp_sums[4]),
+                               __fadd_rn(warp_sums[2], warp_sums[6]));
+  const float odd = __fadd_rn(__fadd_rn(warp_sums[1], warp_sums[5]),
+                              __fadd_rn(warp_sums[3], warp_sums[7]));
+  return __fadd_rn(even, odd);
+}
+
+template <unsigned BlockSize, typename Position, bool ReferenceRms>
 static __global__ void Store(const float* input, const float* weight,
                              const Position* positions, const float* frequencies,
                              const int32_t* slots, float epsilon, size_t frequency_rows,
@@ -29,7 +54,13 @@ static __global__ void Store(const float* input, const float* weight,
   if (slot < 0 || size_t(slot) / page_tokens >= page_count ||
       position < 0 || size_t(position) >= frequency_rows) return;
   const auto* pooled = input + size_t(row) * kWidth;
-  const float sum = SumSquared<BlockSize, kDev, float, float>(pooled, kWidth);
+  float sum;
+  if constexpr (ReferenceRms) {
+    static_assert(BlockSize == 256);
+    sum = PairwiseSumSquared(pooled);
+  } else {
+    sum = SumSquared<BlockSize, kDev, float, float>(pooled, kWidth);
+  }
   __shared__ float inverse_rms;
   if (threadIdx.x == 0) inverse_rms = rsqrtf(sum / 512.0f + epsilon);
   __syncthreads();
@@ -111,10 +142,14 @@ class Operator<DeepseekV4StoreCompressed, Device::Type::kHygon> : public Deepsee
     const auto stream = static_cast<cudaStream_t>(stream_);
     const auto blocks = static_cast<unsigned>(pooled.size(0));
     const auto block_size = RuntimeUtils<Device::Type::kHygon>::GetOptimalBlockSize();
-    const auto launch = [&](auto position, auto block) {
+    const char* mode = page_tokens == 64 && pooled.size(0) == 1
+        ? std::getenv("INFINIOPS_DSV4_C4_STORE_RMS_REF") : nullptr;
+    const bool reference_rms = mode && mode[0] == '1' && mode[1] == '\0';
+    const auto launch = [&](auto position, auto block, auto reference) {
       using Position = decltype(position);
       constexpr unsigned kBlock = decltype(block)::value;
-      v4_store_compressed_detail::Store<kBlock, Position><<<blocks, kBlock, 0, stream>>>(
+      constexpr bool kReferenceRms = decltype(reference)::value;
+      v4_store_compressed_detail::Store<kBlock, Position, kReferenceRms><<<blocks, kBlock, 0, stream>>>(
           static_cast<const float*>(pooled.data()), static_cast<const float*>(weight.data()),
           static_cast<const Position*>(positions.data()),
           static_cast<const float*>(frequencies.data()), static_cast<const int32_t*>(slots.data()),
@@ -122,8 +157,13 @@ class Operator<DeepseekV4StoreCompressed, Device::Type::kHygon> : public Deepsee
           static_cast<uint8_t*>(pages.data()));
     };
     const auto dispatch = [&](auto position) {
-      if (block_size == 256) launch(position, std::integral_constant<unsigned, 256>{});
-      else launch(position, std::integral_constant<unsigned, 128>{});
+      if (reference_rms) {
+        launch(position, std::integral_constant<unsigned, 256>{}, std::true_type{});
+      } else if (block_size == 256) {
+        launch(position, std::integral_constant<unsigned, 256>{}, std::false_type{});
+      } else {
+        launch(position, std::integral_constant<unsigned, 128>{}, std::false_type{});
+      }
     };
     if (positions.dtype() == DataType::kInt32) dispatch(int32_t{});
     else dispatch(int64_t{});
