@@ -127,6 +127,7 @@ __launch_bounds__(kWavefrontSize *kGroupWaves) void mamba_selective_scan_grouped
     T *out, const T *x, const T *dt, const T *b, const T *c, const T *a_log,
     const T *d, const T *gate, const T *dt_bias, float *state, size_t batch,
     size_t seq_len, size_t intermediate_arg, size_t state_size_arg) {
+  constexpr bool kPrefetchState = kGroupWaves <= 4;
   const size_t intermediate = kCanonical ? 4096 : intermediate_arg;
   const size_t state_size = kCanonical ? 16 : state_size_arg;
   const size_t total = batch * intermediate;
@@ -151,6 +152,10 @@ __launch_bounds__(kWavefrontSize *kGroupWaves) void mamba_selective_scan_grouped
   const T *a_ch = a_log + ch * state_size;
   const float d_ch = to_float<T>(d[ch]);
   const float dt_bias_ch = to_float<T>(dt_bias[ch]);
+  const float coefficient_lane =
+      lane < state_size ? -expf(to_float<T>(a_ch[lane])) : 0.0f;
+  float carry_lane =
+      kPrefetchState && lane < state_size ? state[state_base + lane] : 0.0f;
   for (size_t tile_begin = 0; tile_begin < seq_len; tile_begin += tile_tokens) {
     const size_t remaining = seq_len - tile_begin;
     const size_t valid_tokens =
@@ -189,8 +194,7 @@ __launch_bounds__(kWavefrontSize *kGroupWaves) void mamba_selective_scan_grouped
 
     float y_vals[kItems] = {};
     for (size_t n = 0; n < state_size; ++n) {
-      float a_coeff = lane == 0 ? -expf(to_float<T>(a_ch[n])) : 0.0f;
-      a_coeff = __shfl_sync(kWavefrontMask, a_coeff, 0);
+      const float a_coeff = __shfl_sync(kWavefrontMask, coefficient_lane, n);
       AffinePair local_prefix[kItems];
 #pragma unroll
       for (int i = 0; i < kItems; ++i) {
@@ -217,8 +221,13 @@ __launch_bounds__(kWavefrontSize *kGroupWaves) void mamba_selective_scan_grouped
       const AffinePair prefix_before_lane =
           lane == 0 ? AffinePair{1.0f, 0.0f}
                     : AffinePair{previous_a, previous_u};
-      float initial_state = lane == 0 ? state[state_base + n] : 0.0f;
-      initial_state = __shfl_sync(kWavefrontMask, initial_state, 0);
+      float initial_state;
+      if constexpr (kPrefetchState) {
+        initial_state = __shfl_sync(kWavefrontMask, carry_lane, n);
+      } else {
+        initial_state = lane == 0 ? state[state_base + n] : 0.0f;
+        initial_state = __shfl_sync(kWavefrontMask, initial_state, 0);
+      }
       float final_state = initial_state;
 
 #pragma unroll
@@ -234,9 +243,14 @@ __launch_bounds__(kWavefrontSize *kGroupWaves) void mamba_selective_scan_grouped
         }
       }
 
-      if (lane * kItems <= valid_tokens - 1 &&
-          (lane + 1) * kItems > valid_tokens - 1) {
-        state[state_base + n] = final_state;
+      if constexpr (kPrefetchState) {
+        const float next_state = __shfl_sync(kWavefrontMask, final_state,
+                                             (valid_tokens - 1) / kItems);
+        if (lane == n) carry_lane = next_state;
+      } else {
+        if (lane * kItems <= valid_tokens - 1 &&
+            (lane + 1) * kItems > valid_tokens - 1)
+          state[state_base + n] = final_state;
       }
     }
 
@@ -251,6 +265,9 @@ __launch_bounds__(kWavefrontSize *kGroupWaves) void mamba_selective_scan_grouped
       }
     }
     __syncthreads();
+  }
+  if constexpr (kPrefetchState) {
+    if (lane < state_size) state[state_base + lane] = carry_lane;
   }
 }
 
@@ -438,20 +455,24 @@ __launch_bounds__(kThreads) void mamba_selective_scan_decode_s16_kernel(
   }
 }
 
-template <typename T, bool kAligned, int kThreads = 256>
+template <typename T, bool kAligned, int kThreads = 256, bool kStagedBC = false>
 __global__
 __launch_bounds__(kThreads) void mamba_selective_scan_register_s16_kernel(
     T *out, const T *x, const T *dt, const T *b, const T *c, const T *a_log,
-    const T *d, const T *gate, const T *dt_bias, float *state, size_t batch,
-    size_t length, size_t channels) {
+    const T *d, const T *gate, const T *dt_bias, float *state,
+    std::conditional_t<kStagedBC, uint32_t, size_t> batch,
+    std::conditional_t<kStagedBC, uint32_t, size_t> length,
+    std::conditional_t<kStagedBC, uint32_t, size_t> channels_arg) {
+  using Index = std::conditional_t<kStagedBC, uint32_t, size_t>;
+  const Index channels = kStagedBC ? 4096 : channels_arg;
   constexpr int kLanes = 4;
   constexpr int kStatesPerLane = 16 / kLanes;
-  const size_t linear = static_cast<size_t>(blockIdx.x) * (kThreads / kLanes) +
-                        threadIdx.x / kLanes;
+  const Index linear = static_cast<Index>(blockIdx.x) * (kThreads / kLanes) +
+                       threadIdx.x / kLanes;
   if (linear >= batch * channels) return;
   const int lane = threadIdx.x % kLanes;
-  const size_t channel = linear % channels, row = linear / channels;
-  const size_t state_base = linear * 16 + lane * kStatesPerLane;
+  const Index channel = linear % channels, row = linear / channels;
+  const Index state_base = linear * 16 + lane * kStatesPerLane;
   using StateValues = DecodeValues<float, kStatesPerLane>;
   using InputValues = DecodeValues<T, kStatesPerLane>;
   StateValues current;
@@ -467,6 +488,18 @@ __launch_bounds__(kThreads) void mamba_selective_scan_register_s16_kernel(
       logs.values[i] = a_log[channel * 16 + lane * kStatesPerLane + i];
     }
   }
+  // Staged blocks contain only complete channel groups from one request.
+  // Eight KiB keeps multiple register-recursion blocks resident per CU.
+  extern __shared__ unsigned char shared_storage[];
+  T *shared_b = reinterpret_cast<T *>(shared_storage);
+  T *shared_c = shared_b + length * 16;
+  if constexpr (kStagedBC) {
+    for (Index index = threadIdx.x; index < length * 16; index += kThreads) {
+      shared_b[index] = b[row * length * 16 + index];
+      shared_c[index] = c[row * length * 16 + index];
+    }
+    __syncthreads();
+  }
   float coefficients[kStatesPerLane];
 #pragma unroll
   for (int i = 0; i < kStatesPerLane; ++i)
@@ -474,8 +507,8 @@ __launch_bounds__(kThreads) void mamba_selective_scan_register_s16_kernel(
   const float residual = lane == 0 ? to_float<T>(d[channel]) : 0.0f;
   const float bias = lane == 0 ? to_float<T>(dt_bias[channel]) : 0.0f;
 #pragma unroll 1
-  for (size_t token = 0; token < length; ++token) {
-    const size_t offset = (row * length + token) * channels + channel;
+  for (Index token = 0; token < length; ++token) {
+    const Index offset = (row * length + token) * channels + channel;
     float value = 0.0f, delta = 0.0f, activated_gate = 0.0f;
     if (lane == 0) {
       value = to_float<T>(x[offset]);
@@ -487,17 +520,20 @@ __launch_bounds__(kThreads) void mamba_selective_scan_register_s16_kernel(
     value = __shfl_sync(kWavefrontMask, value, 0, kLanes);
     delta = __shfl_sync(kWavefrontMask, delta, 0, kLanes);
     activated_gate = __shfl_sync(kWavefrontMask, activated_gate, 0, kLanes);
-    const size_t bc_offset =
-        (row * length + token) * 16 + lane * kStatesPerLane;
+    const Index bc_offset = (row * length + token) * 16 + lane * kStatesPerLane;
+    const T *token_b = kStagedBC ? shared_b + token * 16 + lane * kStatesPerLane
+                                 : b + bc_offset;
+    const T *token_c = kStagedBC ? shared_c + token * 16 + lane * kStatesPerLane
+                                 : c + bc_offset;
     InputValues b_values, c_values;
     if constexpr (kAligned) {
-      b_values = *reinterpret_cast<const InputValues *>(b + bc_offset);
-      c_values = *reinterpret_cast<const InputValues *>(c + bc_offset);
+      b_values = *reinterpret_cast<const InputValues *>(token_b);
+      c_values = *reinterpret_cast<const InputValues *>(token_c);
     } else {
 #pragma unroll
       for (int i = 0; i < kStatesPerLane; ++i) {
-        b_values.values[i] = b[bc_offset + i];
-        c_values.values[i] = c[bc_offset + i];
+        b_values.values[i] = token_b[i];
+        c_values.values[i] = token_c[i];
       }
     }
     float dot = 0.0f;
@@ -606,6 +642,27 @@ void launch_grouped_scan(const MambaScanLayout &p, T *out, const T *x,
       p, out, x, dt, b, c, a_log, d, gate, dt_bias, state, stream);
 }
 
+// Cap shared B/C storage at eight KiB per block; larger inputs retain
+// the original register recurrence. These are storage/resource bounds.
+constexpr size_t kRegisterBCBytes = 8 * 1024;
+inline bool can_stage_register_bc(const MambaScanLayout &p) {
+  constexpr size_t kByteLimit = 2147483647ULL;
+  const size_t total = p.batch * p.channels;
+  return p.channels == 4096 && total && p.length &&
+         total <= kByteLimit / (16 * sizeof(float)) &&
+         p.length <= kByteLimit / (total * sizeof(uint16_t)) &&
+         p.length <= kRegisterBCBytes / (2 * 16 * sizeof(uint16_t));
+}
+
+inline int register_scan_threads(const MambaScanLayout &p, int compute_units,
+                                 int fallback_threads) {
+  if (!can_stage_register_bc(p)) return fallback_threads;
+  // Spread small workloads across more blocks; use wider blocks once there
+  // are enough independent channels to amortize the shared tile per block.
+  return p.batch * p.channels >= static_cast<size_t>(compute_units) * 256 ? 256
+                                                                          : 128;
+}
+
 // Shape/resource decisions are independent of tensor storage addresses.
 // Alignment remains an invocation-time choice in the family launchers.
 enum class ScanFamily { kDecodeS16, kRegisterS16, kPrefix, kGeneric };
@@ -623,12 +680,15 @@ inline ScanLaunchPlan select_scan_plan(const MambaScanLayout &p,
   if (p.length == 1 && p.states == 16 && p.channels == 4096 && p.batch <= 65535)
     return {ScanFamily::kDecodeS16};
   if (p.states == 16) {
-    if (p.length <= 64) return {ScanFamily::kRegisterS16, 256};
+    if (p.length <= 64)
+      return {ScanFamily::kRegisterS16,
+              register_scan_threads(p, compute_units, 256)};
     // Two independent channel blocks per compute unit hide the recurrence
     // without paying the affine-prefix overhead.
     const size_t independent_blocks = (total + 128 / 4 - 1) / (128 / 4);
     if (independent_blocks >= static_cast<size_t>(compute_units) * 2)
-      return {ScanFamily::kRegisterS16, 128};
+      return {ScanFamily::kRegisterS16,
+              register_scan_threads(p, compute_units, 128)};
   }
   if (p.channels % 4 != 0 || p.states > 64) return {ScanFamily::kGeneric, 256};
   if (p.length <= 64) return {ScanFamily::kPrefix, 0, 1, 4};
@@ -651,16 +711,24 @@ void launch_register_s16(const MambaScanLayout &p, T *out, const T *x,
                        (reinterpret_cast<uintptr_t>(a_log) & 7) == 0 &&
                        (reinterpret_cast<uintptr_t>(b) & 7) == 0 &&
                        (reinterpret_cast<uintptr_t>(c) & 7) == 0;
-  if (aligned)
+  if (aligned && can_stage_register_bc(p)) {
+    const size_t shared_bytes = 2 * p.length * 16 * sizeof(T);
+    mamba_selective_scan_register_s16_kernel<T, true, kThreads, true>
+        <<<blocks, kThreads, shared_bytes, stream>>>(
+            out, x, dt, b, c, a_log, d, gate, dt_bias, state,
+            static_cast<uint32_t>(p.batch), static_cast<uint32_t>(p.length),
+            static_cast<uint32_t>(p.channels));
+  } else if (aligned) {
     mamba_selective_scan_register_s16_kernel<T, true, kThreads>
         <<<blocks, kThreads, 0, stream>>>(out, x, dt, b, c, a_log, d, gate,
                                           dt_bias, state, p.batch, p.length,
                                           p.channels);
-  else
+  } else {
     mamba_selective_scan_register_s16_kernel<T, false, kThreads>
         <<<blocks, kThreads, 0, stream>>>(out, x, dt, b, c, a_log, d, gate,
                                           dt_bias, state, p.batch, p.length,
                                           p.channels);
+  }
 }
 
 template <typename T>

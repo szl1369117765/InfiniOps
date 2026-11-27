@@ -469,6 +469,114 @@ __global__ __launch_bounds__(kThreads) void causal_conv1d_k4_decode_pair_kernel(
       causal_decode_indexed_offset<kCompact>(conv_state, write_base)) = updated;
 }
 
+// Adjacent channel pairs share packed weight/history and two-lane stores.
+// The launcher proves 32-bit offsets and protects cross-request history first.
+template <typename T>
+__device__ __forceinline__ unsigned int causal_conv1d_prefill_pair_output(
+    const CausalHistoryPair &history, const uint4 &weights,
+    unsigned int current, unsigned int biases) {
+  if constexpr (std::is_same_v<T, half>) {
+    return causal_conv1d_fp16_pair_output(history, weights, current, biases);
+  } else {
+    const unsigned int packed[4] = {weights.x, weights.y, weights.z, weights.w};
+    const unsigned int raw[6] = {history.values[0], history.values[0] >> 16,
+                                 history.values[1], history.values[1] >> 16,
+                                 history.values[2], history.values[2] >> 16};
+    unsigned short encoded[2];
+#pragma unroll
+    for (int lane = 0; lane < 2; ++lane) {
+      const unsigned int first = packed[lane * 2],
+                         second = packed[lane * 2 + 1];
+      const float value = conv4_with_bias<T>(
+          causal_decode_bits<T>(first), causal_decode_bits<T>(raw[lane * 3]),
+          causal_decode_bits<T>(first >> 16),
+          causal_decode_bits<T>(raw[lane * 3 + 1]),
+          causal_decode_bits<T>(second),
+          causal_decode_bits<T>(raw[lane * 3 + 2]),
+          causal_decode_bits<T>(second >> 16),
+          causal_decode_bits<T>(current >> (lane * 16)),
+          causal_decode_bits<T>(biases >> (lane * 16)));
+      encoded[lane] = causal_encode_bits<T>(value);
+    }
+    return static_cast<unsigned int>(encoded[0]) |
+           (static_cast<unsigned int>(encoded[1]) << 16);
+  }
+}
+__device__ __forceinline__ CausalHistoryPair causal_prefill_history_pair(
+    unsigned int first, unsigned int second, unsigned int third) {
+  return {{(first & 0xffffu) | (second << 16),
+           (third & 0xffffu) | (first & 0xffff0000u),
+           (second >> 16) | (third & 0xffff0000u)}};
+}
+__device__ __forceinline__ void shift_causal_prefill_history_pair(
+    CausalHistoryPair &h, unsigned int x) {
+  CausalHistoryPair updated;
+  updated.values[0] = (h.values[0] >> 16) | (h.values[1] << 16);
+  updated.values[1] = (x & 0xffffu) | (h.values[2] << 16);
+  updated.values[2] = (h.values[2] >> 16) | (x & 0xffff0000u);
+  h = updated;
+}
+template <typename T, int kTimeTile, bool kHasInitialState>
+__global__ __launch_bounds__(128) void causal_conv1d_k4_paired_prefill_kernel(
+    T *out, T *state, const T *x, const T *weight, const T *bias,
+    const int32_t *initial, const int32_t *final, uint32_t tokens,
+    uint32_t pool_size, const T *snapshot) {
+  constexpr uint32_t C = 4096;
+  constexpr uint32_t kThreads = 128;
+  const uint32_t request = blockIdx.x, chunk = blockIdx.y;
+  const uint32_t channel = (blockIdx.z * kThreads + threadIdx.x) * 2;
+  const int read_slot = kHasInitialState ? initial[request] : request;
+  const int write_slot = final[request];
+  if (static_cast<uint32_t>(read_slot) >= pool_size ||
+      static_cast<uint32_t>(write_slot) >= pool_size)
+    return;
+  const uint4 weights = *reinterpret_cast<const uint4 *>(weight + channel * 4);
+  const unsigned int biases =
+      *reinterpret_cast<const unsigned int *>(bias + channel);
+  const uint32_t base = request * tokens * C + channel;
+  auto read = [&](uint32_t token) {
+    return *reinterpret_cast<const unsigned int *>(x + base + token * C);
+  };
+  auto write = [&](uint32_t token, const CausalHistoryPair &h,
+                   unsigned int current) {
+    *reinterpret_cast<unsigned int *>(out + base + token * C) =
+        causal_conv1d_prefill_pair_output<T>(h, weights, current, biases);
+  };
+  if (chunk == 0) {
+    const T *source = snapshot ? snapshot : state;
+    const uint32_t row = snapshot ? request : static_cast<uint32_t>(read_slot);
+    CausalHistoryPair h = *reinterpret_cast<const CausalHistoryPair *>(
+        source + (row * C + channel) * 3);
+    for (uint32_t token = 0; token < 3 && token < tokens; ++token) {
+      const unsigned int current = read(token);
+      write(token, h, current);
+      shift_causal_prefill_history_pair(h, current);
+    }
+    if (tokens >= 4) {
+      h = causal_prefill_history_pair(read(tokens - 4), read(tokens - 3),
+                                      read(tokens - 2));
+      const unsigned int current = read(tokens - 1);
+      write(tokens - 1, h, current);
+      shift_causal_prefill_history_pair(h, current);
+    }
+    *reinterpret_cast<CausalHistoryPair *>(
+        state + (static_cast<uint32_t>(write_slot) * C + channel) * 3) = h;
+  } else {
+    const uint32_t first = 3 + (chunk - 1) * kTimeTile;
+    CausalHistoryPair h = causal_prefill_history_pair(
+        read(first - 3), read(first - 2), read(first - 1));
+#pragma unroll
+    for (int i = 0; i < kTimeTile; ++i) {
+      const uint32_t token = first + i;
+      if (token < tokens - 1) {
+        const unsigned int current = read(token);
+        write(token, h, current);
+        shift_causal_prefill_history_pair(h, current);
+      }
+    }
+  }
+}
+
 template <typename T, int kTimeTile, int kChannelsPerThread,
           bool kHasInitialState>
 __global__ void causal_conv1d_k4_contiguous_tiled_kernel(
@@ -1312,12 +1420,70 @@ void launch_k4_contiguous_tiled(const ConvInfo &info, void *out,
 // Resource-based policy shared by neighboring B/T values. BF16 conversion
 // pressure needs more independent blocks before increasing channels/thread.
 template <typename T, int kTimeTile>
+bool try_launch_k4_paired_prefill(const ConvInfo &info, void *out,
+                                  void *conv_state, const void *qkv,
+                                  const void *weight, const void *bias,
+                                  const void *initial_state_indices,
+                                  const void *final_state_indices,
+                                  cudaStream_t stream) {
+  if constexpr (sizeof(T) == 2) {
+    constexpr size_t kByteLimit = 2147483647ULL;
+    constexpr size_t kMaxStateRows = kByteLimit / (4096 * 3 * sizeof(T));
+    const size_t time_blocks =
+        1 + (info.T < 4 ? 0 : (info.T - 4 + kTimeTile - 1) / kTimeTile);
+    // Packed histories use fewer live registers than two scalar channels.
+    // Keep enough independent blocks to fill the device for each dtype.
+    const size_t block_budget = static_cast<size_t>(info.compute_units) *
+                                (std::is_same_v<T, half> ? 1 : 2);
+    if (info.T < 4 || !info.request_count ||
+        info.request_count > kMaxStateRows || info.pool_size > kMaxStateRows ||
+        info.T > kByteLimit / (info.request_count * 4096 * sizeof(T)) ||
+        info.request_count * 16 * time_blocks < block_budget ||
+        (reinterpret_cast<uintptr_t>(out) & 3) ||
+        (reinterpret_cast<uintptr_t>(conv_state) & 3) ||
+        (reinterpret_cast<uintptr_t>(qkv) & 3) ||
+        (reinterpret_cast<uintptr_t>(weight) & 15) ||
+        (reinterpret_cast<uintptr_t>(bias) & 3) ||
+        (reinterpret_cast<uintptr_t>(info.history) & 3))
+      return false;
+    const dim3 grid(info.request_count, time_blocks, 4096 / 256);
+    const auto launch = [&](auto initial_tag) {
+      constexpr bool kHasInitialState = decltype(initial_tag)::value;
+      causal_conv1d_k4_paired_prefill_kernel<T, kTimeTile, kHasInitialState>
+          <<<grid, 128, 0, stream>>>(
+              static_cast<T *>(out), static_cast<T *>(conv_state),
+              static_cast<const T *>(qkv), static_cast<const T *>(weight),
+              static_cast<const T *>(bias),
+              static_cast<const int32_t *>(initial_state_indices),
+              static_cast<const int32_t *>(final_state_indices),
+              static_cast<uint32_t>(info.T),
+              static_cast<uint32_t>(info.pool_size),
+              static_cast<const T *>(info.history));
+    };
+    if (initial_state_indices)
+      launch(std::true_type{});
+    else
+      launch(std::false_type{});
+    if (cudaGetLastError() != cudaSuccess)
+      throw std::runtime_error(
+          "Hygon causal conv paired prefill launch failed");
+    return true;
+  }
+  return false;
+}
+
+template <typename T, int kTimeTile>
 void launch_k4_contiguous_family(const ConvInfo &info, void *out,
                                  void *conv_state, const void *qkv,
                                  const void *weight, const void *bias,
                                  const void *initial_state_indices,
                                  const void *final_state_indices,
                                  cudaStream_t stream) {
+  if (try_launch_k4_paired_prefill<T, kTimeTile>(
+          info, out, conv_state, qkv, weight, bias, initial_state_indices,
+          final_state_indices, stream))
+    return;
+
   const size_t time_blocks =
       1 + (info.T < 4 ? 0 : (info.T - 4 + kTimeTile - 1) / kTimeTile);
   constexpr size_t kBlocksPerCu = std::is_same_v<T, __nv_bfloat16> ? 8 : 2;
