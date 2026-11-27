@@ -20,9 +20,18 @@ static __device__ __forceinline__ float logistic(float value) {
   return 1.0f/(1.0f+(Split?__builtin_amdgcn_exp2f(-value*1.4426950408889634f):expf(-value)));
 }
 
+// Use scalar round-to-nearest-even for each packed BF16 result.
+static __device__ __forceinline__ unsigned prefill_bf16_bits(float value) {
+  const unsigned bits = __float_as_uint(value);
+  if ((bits & 0x7fffffffu) > 0x7f800000u) {
+    return unsigned(__bfloat16_as_ushort(__float2bfloat16(value)));
+  }
+  return (bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16;
+}
+
 // Lanes 0..3 produce pre, 4..7 post, and 8..23 the 4x4 matrix. Every matrix
 // element follows the scalar reference's exact FP32 operation/reduction order.
-template<bool Split>
+template<bool Split, bool Vectorized = false>
 static __global__ void mix_parallel(const __nv_bfloat16* residual,const float* values,
     const float* scales,const float* bias,__nv_bfloat16* collapsed,float* post,
     float* combination,size_t rows,size_t hidden,float eps,int64_t iterations,
@@ -75,7 +84,22 @@ static __global__ void mix_parallel(const __nv_bfloat16* residual,const float* v
       combination[row*16+tid-8]=matrix;
     }
     __syncthreads();
-    for(size_t col=tid;col<hidden;col+=blockDim.x) {
+    if constexpr (Vectorized) {
+      static_assert(!Split);
+      for (size_t col = size_t(tid) * 2; col < hidden; col += blockDim.x * 2) {
+        float lo = 0.0f, hi = 0.0f;
+#pragma unroll
+        for (unsigned h = 0; h < 4; ++h) {
+          const auto* here = residual + (row * 4 + h) * hidden + col;
+          const auto pair = *reinterpret_cast<const unsigned*>(here);
+          lo += __uint_as_float(pair << 16) * pre[h];
+          hi += __uint_as_float(pair & 0xffff0000u) * pre[h];
+        }
+        const auto l = prefill_bf16_bits(lo);
+        const auto h = prefill_bf16_bits(hi);
+        *reinterpret_cast<unsigned*>(collapsed + row * hidden + col) = l | (h << 16);
+      }
+    } else for(size_t col=tid;col<hidden;col+=blockDim.x) {
       if constexpr(Split) {
         const float a=__bfloat162float(residual[row*4*hidden+col]);
         const float b=__bfloat162float(residual[(row*4+1)*hidden+col]);

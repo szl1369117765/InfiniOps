@@ -11,6 +11,28 @@ constexpr unsigned kGroupHidden = 4096;
 constexpr unsigned kGroupInner = 256;
 constexpr unsigned kM12GroupTokens = 3 * kGroupTokens;
 
+// Split a small batch into tiles without a single-row tail when possible.
+struct ExpertTiles {
+  unsigned count;
+  unsigned width;
+
+  explicit ExpertTiles(unsigned tokens)
+      : count((tokens + kGroupTokens - 1) / kGroupTokens),
+        width((tokens + count - 1) / count) {}
+};
+
+struct ExpertTile {
+  unsigned first;
+  unsigned rows;
+};
+
+static __device__ __forceinline__ ExpertTile MakeExpertTile(
+    unsigned tile, unsigned width, unsigned tokens) {
+  const unsigned first = tile * width;
+  const unsigned remaining = tokens - first;
+  return {first, remaining < width ? remaining : width};
+}
+
 template <class T>
 static __device__ float FinishGateUp(int32_t gate, int32_t up,
                                      float token_scale, float gate_scale,
@@ -35,13 +57,20 @@ static __device__ float FinishGateUp(int32_t gate, int32_t up,
 
 template <unsigned TopK>
 __global__ void BuildQ4ExpertGroups(const int64_t* ids, size_t experts,
-                                    float* activated, Q4ExpertGroup* groups) {
+                                    float* activated, Q4ExpertGroup* groups,
+                                    unsigned tokens, unsigned tile_width) {
+  const auto tile = MakeExpertTile(blockIdx.x, tile_width, tokens);
+  const unsigned first_route = tile.first * TopK;
+  const unsigned routes = tile.rows * TopK;
+  ids += first_route;
+  activated += first_route * kGroupInner;
+  groups += first_route;
   const unsigned slot = threadIdx.x;
-  if (slot < kGroupTokens * TopK)
-    groups[slot] = FindQ4ExpertGroup<TopK>(ids, slot, experts);
+  if (slot < routes)
+    groups[slot] = FindQ4ExpertGroup<TopK>(ids, slot, experts, tile.rows);
   // Invalid expert slots must have the same activation as the fallback.
   // Valid slots are fully written by GateUpQ4 during this replay.
-  for (unsigned row = 0; row < kGroupTokens * TopK; ++row) {
+  for (unsigned row = 0; row < routes; ++row) {
     const auto expert = ids[row];
     if (expert < 0 || static_cast<size_t>(expert) >= experts) {
       for (unsigned col = slot; col < kGroupInner; col += kGroupWave)
@@ -84,12 +113,20 @@ static __device__ __forceinline__ int32_t Q4WaveSum(int32_t value) {
 template <class T, unsigned TopK>
 __global__ void GateUpQ4(const int8_t* input, const float* input_scale,
                          const Q4ExpertGroup* groups, const int8_t* weights,
-                         const float* scales, float* activated, float limit) {
+                         const float* scales, float* activated, float limit,
+                         unsigned tokens, unsigned tile_width) {
   constexpr bool routed = TopK != 1;
   const unsigned wave = threadIdx.x / kGroupWave;
   const unsigned lane = threadIdx.x % kGroupWave;
   const unsigned index = blockIdx.x * kGroupWaves + wave;
-  const auto group = groups[index / kGroupInner];
+  const auto tile = MakeExpertTile(blockIdx.y, tile_width, tokens);
+  const unsigned group_index = index / kGroupInner;
+  if (group_index >= tile.rows * TopK) return;
+  const unsigned first_route = tile.first * TopK;
+  input += tile.first * kGroupHidden;
+  input_scale += tile.first;
+  activated += first_route * kGroupInner;
+  const auto group = groups[first_route + group_index];
   if (group.expert < 0) return;
 
   const unsigned channel = index % kGroupInner;
@@ -129,10 +166,19 @@ __global__ void RoutedDownQ4(const int8_t* activated,
                              const Q4ExpertGroup* groups,
                              const float* route_weights, const int8_t* weights,
                              const float* scales, T* out, size_t experts,
-                             float routed_scale) {
+                             float routed_scale, unsigned tokens,
+                             unsigned tile_width) {
   using Convert = Caster<Device::Type::kHygon>;
-  constexpr unsigned routes = kGroupTokens * kGroupTopK;
-  __shared__ float contributions[routes];
+  const auto tile = MakeExpertTile(blockIdx.y, tile_width, tokens);
+  const unsigned first_route = tile.first * kGroupTopK;
+  const unsigned routes = tile.rows * kGroupTopK;
+  activated += first_route * kGroupInner;
+  activation_scale += first_route;
+  ids += first_route;
+  groups += first_route;
+  route_weights += first_route;
+  out += tile.first * kGroupHidden;
+  __shared__ float contributions[kGroupTokens * kGroupTopK];
   const unsigned wave = threadIdx.x / kGroupWave;
   const unsigned lane = threadIdx.x % kGroupWave;
   const unsigned channel = blockIdx.x;
@@ -160,7 +206,7 @@ __global__ void RoutedDownQ4(const int8_t* activated,
   }
   __syncthreads();
   const unsigned token = threadIdx.x;
-  if (token < kGroupTokens) {
+  if (token < tile.rows) {
     float output = 0.0f;
     for (unsigned k = 0; k < kGroupTopK; ++k) {
       const unsigned slot = token * kGroupTopK + k;
@@ -173,19 +219,67 @@ __global__ void RoutedDownQ4(const int8_t* activated,
   }
 }
 
+// Each wave owns one gate/up channel and loads its weights once for all rows.
+template <class T, unsigned Rows>
+__global__ void SharedGateUpDecode(const int8_t* input, const float* input_scale,
+                                   const int64_t* ids, const int8_t* weights,
+                                   const float* scales, float* activated,
+                                   float limit, unsigned rows) {
+  const unsigned lane = threadIdx.x % kGroupWave;
+  const unsigned channel = blockIdx.x * kGroupWaves + threadIdx.x / kGroupWave;
+  const unsigned up_channel = channel + kGroupInner;
+  const auto* gate_row = weights + channel * kGroupHidden;
+  const auto* up_row = weights + up_channel * kGroupHidden;
+  int32_t gate[Rows] = {}, up[Rows] = {};
+  unsigned valid_mask = 0;
+#pragma unroll
+  for (unsigned row = 0; row < Rows; ++row)
+    if (row < rows && ids[row] == 0) valid_mask |= 1u << row;
+#pragma unroll 2
+  for (unsigned i = lane * 4; valid_mask && i < kGroupHidden; i += kGroupWave * 4) {
+    const int32_t gate_weights = LoadPackedInt8(gate_row + i);
+    const int32_t up_weights = LoadPackedInt8(up_row + i);
+#pragma unroll
+    for (unsigned row = 0; row < Rows; ++row) {
+      if ((valid_mask & (1u << row)) == 0) continue;
+      const int32_t value = LoadPackedInt8(input + row * kGroupHidden + i);
+      gate[row] = Dot4(value, gate_weights, gate[row]);
+      up[row] = Dot4(value, up_weights, up[row]);
+    }
+  }
+#pragma unroll
+  for (unsigned row = 0; row < Rows; ++row) {
+    if (row >= rows) break;
+    const int32_t g = Q4WaveSum(gate[row]), u = Q4WaveSum(up[row]);
+    if (lane == 0) {
+      activated[row * kGroupInner + channel] = (valid_mask & (1u << row))
+          ? FinishGateUp<T>(g, u, input_scale[row], scales[channel],
+                            scales[up_channel], limit, false, false)
+          : 0.0f;
+    }
+  }
+}
+
 // The shared path has one expert. All valid rows use the same packed weight.
-template <class T>
-__global__ void SharedDownQ4(const int8_t* activated,
+template <class T, unsigned Rows>
+__global__ void SharedDownRows(const int8_t* activated,
                              const float* activation_scale, const int64_t* ids,
                              const float* route_weights, const int8_t* weights,
-                             const float* scales, T* out) {
+                             const float* scales, T* out, unsigned tokens) {
   using Convert = Caster<Device::Type::kHygon>;
+  const auto tile = MakeExpertTile(blockIdx.y, Rows, tokens);
+  activated += tile.first * kGroupInner;
+  activation_scale += tile.first;
+  ids += tile.first;
+  route_weights += tile.first;
+  out += tile.first * kGroupHidden;
   const unsigned channel = blockIdx.x * kGroupWaves + threadIdx.x / kGroupWave;
   const unsigned lane = threadIdx.x % kGroupWave;
   const int32_t packed_weight =
       LoadPackedInt8(weights + channel * kGroupInner + lane * 4);
 #pragma unroll
-  for (unsigned token = 0; token < kGroupTokens; ++token) {
+  for (unsigned token = 0; token < Rows; ++token) {
+    if (token >= tile.rows) break;
     float output = 0.0f;
     if (ids[token] == 0) {
       const int32_t value =
@@ -208,24 +302,17 @@ static cudaError_t LaunchGroupedGateUp(
     const int8_t* weights, const float* scales, float* activated,
     Q4ExpertGroup* groups, size_t tokens, size_t experts, float limit,
     cudaStream_t stream) {
-  constexpr auto tile_routes = kGroupTokens * TopK;
   constexpr auto block = kGroupWave * kGroupWaves;
-  for (size_t row = 0; row < tokens; row += kGroupTokens) {
-    const auto slot = row * TopK;
-    auto* tile_activation = activated + slot * kGroupInner;
-    auto* tile_groups = groups + slot;
-    BuildQ4ExpertGroups<TopK><<<1, kGroupWave, 0, stream>>>(
-        ids + slot, experts, tile_activation, tile_groups);
-    auto status = cudaGetLastError();
-    if (status != cudaSuccess) return status;
-    GateUpQ4<T, TopK>
-        <<<tile_routes * kGroupInner / kGroupWaves, block, 0, stream>>>(
-            input + row * kGroupHidden, input_scale + row, tile_groups, weights,
-            scales, tile_activation, limit);
-    status = cudaGetLastError();
-    if (status != cudaSuccess) return status;
-  }
-  return cudaSuccess;
+  const ExpertTiles tiles(tokens);
+  BuildQ4ExpertGroups<TopK><<<tiles.count, kGroupWave, 0, stream>>>(
+      ids, experts, activated, groups, tokens, tiles.width);
+  auto status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+  const dim3 grid(tiles.width * TopK * kGroupInner / kGroupWaves, tiles.count);
+  GateUpQ4<T, TopK><<<grid, block, 0, stream>>>(
+      input, input_scale, groups, weights, scales, activated, limit, tokens,
+      tiles.width);
+  return cudaGetLastError();
 }
 
 template <class T, unsigned TopK>
@@ -235,24 +322,19 @@ static cudaError_t LaunchGroupedDown(
     T* out, const Q4ExpertGroup* groups, size_t tokens, size_t experts,
     float routed_scale, cudaStream_t stream) {
   constexpr auto block = kGroupWave * kGroupWaves;
-  for (size_t row = 0; row < tokens; row += kGroupTokens) {
-    const auto slot = row * TopK;
-    const auto* tile_activation = activated + slot * kGroupInner;
-    auto* tile_out = out + row * kGroupHidden;
-    if constexpr (TopK == 1) {
-      SharedDownQ4<T><<<kGroupHidden / kGroupWaves, block, 0, stream>>>(
-          tile_activation, activation_scale + slot, ids + slot,
-          route_weights + slot, weights, scales, tile_out);
-    } else {
-      RoutedDownQ4<T><<<kGroupHidden, block, 0, stream>>>(
-          tile_activation, activation_scale + slot, ids + slot, groups + slot,
-          route_weights + slot, weights, scales, tile_out, experts,
-          routed_scale);
-    }
-    const auto status = cudaGetLastError();
-    if (status != cudaSuccess) return status;
+  const ExpertTiles tiles(tokens);
+  if constexpr (TopK == 1) {
+    const dim3 grid(kGroupHidden / kGroupWaves, tiles.count);
+    SharedDownRows<T, kGroupTokens><<<grid, block, 0, stream>>>(
+        activated, activation_scale, ids, route_weights, weights, scales, out,
+        tokens);
+  } else {
+    const dim3 grid(kGroupHidden, tiles.count);
+    RoutedDownQ4<T><<<grid, block, 0, stream>>>(
+        activated, activation_scale, ids, groups, route_weights, weights,
+        scales, out, experts, routed_scale, tokens, tiles.width);
   }
-  return cudaSuccess;
+  return cudaGetLastError();
 }
 
 }  // namespace infini::ops::deepseek_v4_w8a8_detail

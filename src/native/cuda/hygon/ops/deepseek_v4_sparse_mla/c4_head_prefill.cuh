@@ -40,12 +40,20 @@ static __device__ __forceinline__ void load_aligned_mla_key(
   }
 }
 
-// Long buffers amortize unpacking over enough queries to use up to 128 MiB.
-// Smaller calls retain their original 40 MiB workspace budget.
+// Bound decoded pages by both absolute workspace and expected reuse.
+// Long single requests can amortize decoding without needing a batch.
 static size_t decoded_mla_workspace(size_t swa_pages, size_t extra_pages, size_t extra_tokens,
-                                    size_t query_rows = 0) {
+                                    size_t query_rows, bool expand) {
   constexpr size_t kSwaPageTokens = 256;
-  const size_t max_tokens = query_rows >= 16384 && query_rows <= 32768 ? 65536 : 20480;
+  constexpr size_t kCompactTokens = 20480;
+  constexpr size_t kMaxDecodedTokens = 65536;
+  size_t max_tokens = query_rows >= 16384 && query_rows <= 32768
+                          ? kMaxDecodedTokens : kCompactTokens;
+  if (expand &&
+      query_rows > kFlashMlaMaxRows && query_rows < 16384) {
+    // The numerator is packed tokens, and each unpacked token is FP32[512].
+    max_tokens = std::max(max_tokens, std::min(kMaxDecodedTokens, query_rows * 16));
+  }
   if (swa_pages > max_tokens / kSwaPageTokens) return 0;
   const size_t swa_tokens = swa_pages * kSwaPageTokens;
   if (extra_tokens && extra_pages > (max_tokens - swa_tokens) / extra_tokens) return 0;

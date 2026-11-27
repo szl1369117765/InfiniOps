@@ -56,8 +56,15 @@ static __device__ __forceinline__ void project_decode_tile(
   }
 }
 
+template<bool Batch = false>
 static __global__ void project_decode(const __nv_bfloat16* x, const float* w,
                                       float* dots, float* squares) {
+  if constexpr (Batch) {
+    const size_t row = blockIdx.x;
+    x += row * (4 * DecodeHidden);
+    dots += row * Splits * Outputs;
+    squares += row * Splits;
+  }
   if (blockIdx.y == 0) project_decode_tile<true>(x, w, dots, squares);
   else project_decode_tile<false>(x, w, dots, squares);
 }
@@ -76,11 +83,21 @@ static __device__ __forceinline__ float mix_column_pairs(float value, unsigned l
   return pair + __shfl_xor(pair, 8, 64);
 }
 
+template<bool Batch = false>
 static __global__ void mix_decode(
     const __nv_bfloat16* residual, const float* values, const float* scales, const float* bias,
     __nv_bfloat16* collapsed, float* post, float* combination, float eps, int64_t iterations,
     const float* squares, float norm_eps) {
   constexpr unsigned hidden = DecodeHidden;
+  if constexpr (Batch) {
+    const size_t row = blockIdx.y;
+    residual += row * (4 * hidden);
+    values += row * Splits * Outputs;
+    collapsed += row * hidden;
+    post += row * 4;
+    combination += row * 16;
+    squares += row * Splits;
+  }
   const unsigned lane = threadIdx.x;
   const float inverse = rsqrtf(ordered_splits(squares, 1) / float(4 * hidden) + norm_eps);
   // Matrix normalization and post gates depend on the projection only.

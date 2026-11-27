@@ -291,6 +291,25 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
     return mode && mode[0] == '1' && mode[1] == '\0';
   }
 
+  static bool decode_group_enabled(bool routed) {
+    // An execution Graph captures kernel selection. Freeze these process-wide
+    // opt-ins so later replays cannot silently change the requested path.
+    static const bool shared = flag_enabled("INFINI_HYGON_MOE_DECODE_SHARED");
+    static const bool experts = flag_enabled("INFINI_HYGON_MOE_DECODE_ROUTED");
+    return routed ? experts : shared;
+  }
+
+  static bool decode_group_shape(const Tensor& x, const Tensor& weights,
+                                 size_t inner, size_t experts, bool routed) {
+    using namespace deepseek_v4_w8a8_detail;
+    const size_t min_rows = routed ? kGroupTokens : 2;
+    return x.dtype() == DataType::kBFloat16 &&
+           x.size(0) >= min_rows && x.size(0) <= 2 * kGroupTokens &&
+           x.size(1) == kGroupHidden && inner == kGroupInner &&
+           ((routed && weights.size(1) == kGroupTopK && experts == 256) ||
+            (!routed && weights.size(1) == 1 && experts == 1));
+  }
+
   static bool group_shape(const Tensor& x, const Tensor& weights, size_t inner,
                           size_t experts, bool routed) {
     using namespace deepseek_v4_w8a8_detail;
@@ -307,8 +326,10 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
     const size_t tokens = x.size(0), routes = weights.numel();
     const size_t bytes = (routes * inner + tokens + routes) * sizeof(float) +
                          tokens * x.size(1) + routes * inner;
-    const size_t group_bytes = group_shape(x, weights, inner, experts, routed)
-                                   ? routes * sizeof(Q4ExpertGroup) : 0;
+    const bool reserve_groups = group_shape(x, weights, inner, experts, routed) ||
+        (routed && decode_group_enabled(true) &&
+         decode_group_shape(x, weights, inner, experts, true));
+    const size_t group_bytes = reserve_groups ? routes * sizeof(Q4ExpertGroup) : 0;
     const size_t packed_bytes =
         grouped_ ? 7 + expert_grouped::workspace_bytes(routes, experts) : 0;
     return bytes + (packed_bytes > group_bytes ? packed_bytes : group_bytes);
@@ -359,9 +380,14 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
                         reinterpret_cast<uintptr_t>(down.data()) % 4 == 0;
     const bool routed = routed_scale.has_value();
     const bool m12 = tokens == kM12GroupTokens;
-    const bool grouped = packed && group_shape(x, weights, inner, down.size(0), routed) &&
-                         flag_enabled(m12 ? "INFINI_HYGON_MOE_M12_GROUP"
-                                          : "INFINI_HYGON_MOE_Q4_GROUP");
+    const bool decode_group = packed && decode_group_enabled(routed) &&
+        decode_group_shape(x, weights, inner, down.size(0), routed);
+    const bool shared_decode = decode_group && !routed;
+    const bool legacy_grouped = packed &&
+        group_shape(x, weights, inner, down.size(0), routed) &&
+        flag_enabled(m12 ? "INFINI_HYGON_MOE_M12_GROUP"
+                         : "INFINI_HYGON_MOE_Q4_GROUP");
+    const bool grouped = (decode_group && routed) || legacy_grouped;
     auto* groups = grouped ? reinterpret_cast<Q4ExpertGroup*>(q_activated + routes * inner) : nullptr;
     cublasHandle_t dtk_handle = nullptr;
     int32_t* dtk_dots = nullptr;
@@ -393,6 +419,14 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
       SharedDtkGateEpilogue<T><<<dtk_grid(kDtkSharedInner), kDtkEpilogueThreads, 0, stream>>>(
           dtk_dots, input_scale, ids, static_cast<const float*>(gate_up_scale.data()),
           activated, tokens, static_cast<float>(limit));
+    } else if (shared_decode) {
+      const auto launch = tokens <= kGroupTokens
+          ? SharedGateUpDecode<T, kGroupTokens>
+          : SharedGateUpDecode<T, 2 * kGroupTokens>;
+      launch<<<kGroupInner / kGroupWaves, kGroupWave * kGroupWaves, 0, stream>>>(
+          q_input, input_scale, ids, static_cast<const int8_t*>(gate_up.data()),
+          static_cast<const float*>(gate_up_scale.data()), activated,
+          static_cast<float>(limit), tokens);
     } else if (grouped) {
       const auto launch_gate = routed ? LaunchGroupedGateUp<T, kGroupTopK>
                                       : LaunchGroupedGateUp<T, 1>;
@@ -431,6 +465,14 @@ class Operator<DeepseekV4W8a8Experts, Device::Type::kHygon>
       SharedDtkDownEpilogue<T><<<dtk_grid(kDtkSharedHidden), kDtkEpilogueThreads, 0, stream>>>(
           dtk_dots, activation_scale, ids, static_cast<const float*>(weights.data()),
           static_cast<const float*>(down_scale.data()), static_cast<T*>(out.data()), tokens);
+    } else if (shared_decode) {
+      const auto launch = tokens <= kGroupTokens
+          ? SharedDownRows<T, kGroupTokens>
+          : SharedDownRows<T, 2 * kGroupTokens>;
+      launch<<<kGroupHidden / kGroupWaves, kGroupWave * kGroupWaves, 0, stream>>>(
+          q_activated, activation_scale, ids, static_cast<const float*>(weights.data()),
+          static_cast<const int8_t*>(down.data()), static_cast<const float*>(down_scale.data()),
+          static_cast<T*>(out.data()), tokens);
     } else if (grouped) {
       const auto launch_down = routed ? LaunchGroupedDown<T, kGroupTopK>
                                       : LaunchGroupedDown<T, 1>;

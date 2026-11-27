@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include "base/deepseek_v4_mhc_pre.h"
 #include "head.cuh"
 #include "decoder_projection.cuh"
@@ -236,6 +237,30 @@ class Operator<DeepseekV4MhcPre,Device::Type::kHygon> : public DeepseekV4MhcPre 
     // hidden widths on their established paths.
     const bool flash_decoder = it > 0 && x.size(2) == 4096;
     const bool single_token_decoder = flash_decoder && rows == 1;
+    if (DeepseekV4MhcPreSingleTokenBatchConfig::Enabled(config_ptr_.get())) {
+      const bool aligned =
+          reinterpret_cast<uintptr_t>(residual) % alignof(uint2) == 0 &&
+          reinterpret_cast<uintptr_t>(weight) % alignof(v4_mhc_opt::Float4) == 0;
+      if (!flash_decoder || !aligned || rows < 2 || rows > 8) {
+        throw std::invalid_argument("Invalid DeepSeek V4 mHC single-token batch");
+      }
+      squares = v + rows * kSplits * kWidth;
+      // Each grid slice retains the single-token MMAC and reduction order.
+      v4_mhc_opt::project_decode<true><<<dim3(rows, 2, kSplits),64,0,stream>>>(
+          residual,weight,v,squares);
+      if (cudaGetLastError() != cudaSuccess) {
+        throw std::runtime_error("DeepSeek V4 batched mHC projection launch failed");
+      }
+      v4_mhc_opt::mix_decode<true>
+          <<<dim3(1 + v4_mhc_opt::DecodeCollapseBlocks,rows),128,0,stream>>>(
+          residual,v,static_cast<const float*>(s.data()),static_cast<const float*>(b.data()),
+          static_cast<__nv_bfloat16*>(y.data()),static_cast<float*>(p.data()),
+          static_cast<float*>(c.data()),float(m),it,squares,float(e));
+      if (cudaGetLastError() != cudaSuccess) {
+        throw std::runtime_error("DeepSeek V4 batched mHC mix launch failed");
+      }
+      return;
+    }
     if (use_split_projection(rows,x.size(2),it)) {
       squares = v + rows*kSplits*kWidth;
       const dim3 split_grid((rows+15)/16,2,kSplits);
@@ -248,7 +273,7 @@ class Operator<DeepseekV4MhcPre,Device::Type::kHygon> : public DeepseekV4MhcPre 
             reinterpret_cast<uintptr_t>(residual) % alignof(uint2) == 0 &&
             reinterpret_cast<uintptr_t>(weight) % alignof(v4_mhc_opt::Float4) == 0;
         if (single_token_decoder && decode_aligned) {
-          v4_mhc_opt::project_decode<<<split_grid,64,0,stream>>>(residual,weight,v,squares);
+          v4_mhc_opt::project_decode<><<<split_grid,64,0,stream>>>(residual,weight,v,squares);
         } else if (aligned) {
           if (rows > 64) v4_mhc_opt::project_split<true,true><<<split_grid,64,0,stream>>>(residual,weight,v,squares,rows,width);
           else v4_mhc_opt::project_split<false,true><<<split_grid,64,0,stream>>>(residual,weight,v,squares,rows,width);
@@ -273,7 +298,7 @@ class Operator<DeepseekV4MhcPre,Device::Type::kHygon> : public DeepseekV4MhcPre 
     }
     if(cudaGetLastError()!=cudaSuccess) throw std::runtime_error("DeepSeek V4 mHC projection launch failed");
     if (single_token_decoder) {
-      v4_mhc_opt::mix_decode<<<1 + v4_mhc_opt::DecodeCollapseBlocks,128,0,stream>>>(
+      v4_mhc_opt::mix_decode<><<<1 + v4_mhc_opt::DecodeCollapseBlocks,128,0,stream>>>(
           residual,v,static_cast<const float*>(s.data()),static_cast<const float*>(b.data()),
           static_cast<__nv_bfloat16*>(y.data()),static_cast<float*>(p.data()),
           static_cast<float*>(c.data()),float(m),it,squares,float(e));
@@ -281,7 +306,15 @@ class Operator<DeepseekV4MhcPre,Device::Type::kHygon> : public DeepseekV4MhcPre 
       if (squares) v4_mhc_opt::mix_parallel<true><<<grid(rows),128,0,stream>>>(residual,v,static_cast<const float*>(s.data()),
           static_cast<const float*>(b.data()),static_cast<__nv_bfloat16*>(y.data()),
           static_cast<float*>(p.data()),static_cast<float*>(c.data()),rows,x.size(2),float(m),it,squares,float(e));
-      else v4_mhc_opt::mix_parallel<false><<<grid(rows),128,0,stream>>>(residual,v,static_cast<const float*>(s.data()),
+      else if (const char* pairs = std::getenv("INFINIOPS_DSV4_MHC_PRE_PAIRS");
+               pairs && pairs[0] == '1' && pairs[1] == '\0' && rows >= 1024 &&
+               ((reinterpret_cast<uintptr_t>(residual) |
+                 reinterpret_cast<uintptr_t>(y.data())) & 3u) == 0) {
+        v4_mhc_opt::mix_parallel<false,true><<<grid(rows),128,0,stream>>>(
+            residual,v,static_cast<const float*>(s.data()),
+            static_cast<const float*>(b.data()),static_cast<__nv_bfloat16*>(y.data()),
+            static_cast<float*>(p.data()),static_cast<float*>(c.data()),rows,x.size(2),float(m),it,nullptr,float(e));
+      } else v4_mhc_opt::mix_parallel<false><<<grid(rows),128,0,stream>>>(residual,v,static_cast<const float*>(s.data()),
           static_cast<const float*>(b.data()),static_cast<__nv_bfloat16*>(y.data()),
           static_cast<float*>(p.data()),static_cast<float*>(c.data()),rows,x.size(2),float(m),it,nullptr,float(e));
     } else {

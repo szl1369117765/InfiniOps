@@ -3,6 +3,7 @@
 #include "kernel_v2.cuh"
 #include "native/cuda/hygon/caster.cuh"
 
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -240,7 +241,7 @@ static __global__ void GateQuant(
   }
 }
 
-template <bool Routed, unsigned Slices = 1>
+template <bool Routed, unsigned Slices = 1, bool Coalesced = false>
 static __global__ void Down(const int8_t* activated, const float* activation_scale,
                             const float* weights, const int8_t* down, const float* scales,
                             __nv_bfloat16* output, Plan plan, unsigned hidden, unsigned inner,
@@ -262,25 +263,62 @@ static __global__ void Down(const int8_t* activated, const float* activation_sca
     for (unsigned t = 0; t < Slices; ++t)
       dots[t] = mmac(value, load8(weight, offset + t * kNTile * inner), dots[t]);
   }
-  if (!valid) return;
-  const float token_scale = activation_scale[route];
-  const float routing_weight = weights[route];
-  using Convert = Caster<Device::Type::kHygon>;
-  using deepseek_v4_w8a8_detail::ScaledDot;
+  if constexpr (Coalesced) {
+    static_assert(Slices == 4);
+    // Adjacent threads store adjacent hidden columns for each routed row.
+    // Leave the route order seen by Combine and the BF16 conversion unchanged.
+    constexpr auto width = Slices * kNTile;
+    __shared__ __nv_bfloat16 results[kM][width+2];
+    const float token_scale = activation_scale[route];
+    const float routing_weight = weights[route];
+    using Convert = Caster<Device::Type::kHygon>;
+    using deepseek_v4_w8a8_detail::ScaledDot;
 #pragma unroll
-  for (unsigned t = 0; t < Slices; ++t) {
+    for (unsigned t = 0; t < Slices; ++t) {
 #pragma unroll
-    for (unsigned o = 0; o < 4; ++o) {
-      const unsigned channel = t * kNTile + lane_k + 4 * o;
-      const float scaled = ScaledDot(dots[t][o], token_scale, scales[weight_row + channel], true);
-      if constexpr (Routed) {
-        output[size_t(route) * kDownColumns + col + channel] =
-            Convert::template Cast<__nv_bfloat16>(scaled * routing_weight);
-      } else {
-        float value = 0.0f;
-        value += scaled * routing_weight;
-        output[size_t(route) * hidden + first_col + col + channel] =
+      for (unsigned o = 0; o < 4; ++o) {
+        const unsigned channel = t * kNTile + lane_k + 4 * o;
+        const float scaled = ScaledDot(dots[t][o], token_scale, scales[weight_row + channel], true);
+        float value = scaled * routing_weight;
+        if constexpr (!Routed) value = 0.0f + value;
+        if (valid) results[lane_row][channel + threadIdx.x / 64 * kN] =
             Convert::template Cast<__nv_bfloat16>(value);
+      }
+    }
+    __syncthreads();
+    for (unsigned index = threadIdx.x; index < tile.count * width; index += blockDim.x) {
+      const auto row = index / width;
+      const auto channel = index % width;
+      const auto destination = plan.routes[tile.start + row];
+      if constexpr (Routed) {
+        output[size_t(destination) * kDownColumns + blockIdx.y * width + channel] =
+            results[row][channel];
+      } else {
+        output[size_t(destination) * hidden + first_col + blockIdx.y * width + channel] =
+            results[row][channel];
+      }
+    }
+  } else {
+    if (!valid) return;
+    const float token_scale = activation_scale[route];
+    const float routing_weight = weights[route];
+    using Convert = Caster<Device::Type::kHygon>;
+    using deepseek_v4_w8a8_detail::ScaledDot;
+#pragma unroll
+    for (unsigned t = 0; t < Slices; ++t) {
+#pragma unroll
+      for (unsigned o = 0; o < 4; ++o) {
+        const unsigned channel = t * kNTile + lane_k + 4 * o;
+        const float scaled = ScaledDot(dots[t][o], token_scale, scales[weight_row + channel], true);
+        if constexpr (Routed) {
+          output[size_t(route) * kDownColumns + col + channel] =
+              Convert::template Cast<__nv_bfloat16>(scaled * routing_weight);
+        } else {
+          float value = 0.0f;
+          value += scaled * routing_weight;
+          output[size_t(route) * hidden + first_col + col + channel] =
+              Convert::template Cast<__nv_bfloat16>(value);
+        }
       }
     }
   }
@@ -347,6 +385,10 @@ inline void run(cudaStream_t stream, const __nv_bfloat16* input,
         activations, q_activated, activation_scale, routes, inner);
   }
   constexpr unsigned wide_tiles = 4;
+  const char* write_mode = std::getenv("INFINIOPS_DSV4_EXPERT_COALESCED_WRITE");
+  const bool coalesced = write_mode && write_mode[0] == '1' && write_mode[1] == '\0';
+  const auto routed_wide = coalesced ? Down<true, wide_tiles, true> : Down<true, wide_tiles>;
+  const auto shared_wide = coalesced ? Down<false, wide_tiles, true> : Down<false, wide_tiles>;
   const auto down_tile_width = kNTile * (wide ? wide_tiles : 1);
   if (routed) {
     const dim3 down_grid(tiles, kDownColumns / down_tile_width);
@@ -354,7 +396,7 @@ inline void run(cudaStream_t stream, const __nv_bfloat16* input,
     const auto combine_grid = (tokens * kDownColumns + kThreads - 1) / kThreads;
     for (unsigned first = 0; first < hidden; first += kDownColumns) {
       if (wide)
-        Down<true, wide_tiles><<<down_grid,kThreads,0,stream>>>(q_activated, activation_scale,
+        routed_wide<<<down_grid,kThreads,0,stream>>>(q_activated, activation_scale,
             route_weights, down, down_scales, partial, plan, hidden, inner, first);
       else
         Down<true><<<down_grid,kThreads,0,stream>>>(q_activated, activation_scale,
@@ -367,7 +409,7 @@ inline void run(cudaStream_t stream, const __nv_bfloat16* input,
       throw std::runtime_error("DeepSeek V4 shared expert output reset failed");
     const dim3 down_grid(tiles, hidden / down_tile_width);
     if (wide)
-      Down<false, wide_tiles><<<down_grid,kThreads,0,stream>>>(q_activated, activation_scale,
+      shared_wide<<<down_grid,kThreads,0,stream>>>(q_activated, activation_scale,
           route_weights, down, down_scales, output, plan, hidden, inner, 0);
     else
       Down<false><<<down_grid,kThreads,0,stream>>>(q_activated, activation_scale,

@@ -6,6 +6,7 @@
 #include "native/cuda/hygon/flash_mla/bridge.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -316,7 +317,7 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
           if (share_prefill_heads_) {
             workspace_bytes_ = v4_sparse_mla_detail::decoded_mla_workspace(
                 swa.size(0), extra ? extra->size(0) : 0,
-                extra ? static_cast<size_t>(extra_page_size) : 0, q.size(0));
+                extra ? static_cast<size_t>(extra_page_size) : 0, q.size(0), true);
           }
         }
       }
@@ -358,8 +359,10 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
       if (long_prefill_ && q.size(0) > kFlashMlaMaxRows && q.size(1) <= 64) {
         if (share_prefill_heads_ && q.size(1) == 8) {
           const auto stream = static_cast<cudaStream_t>(stream_);
+          const char* expansion = std::getenv("INFINIOPS_DSV4_PREFILL_DECODED_PAGES");
+          const bool expand = expansion && expansion[0] == '1' && expansion[1] == '\0';
           const size_t required = decoded_mla_workspace(
-              first.page_count, second.page_count, second.page_tokens, q.size(0));
+              first.page_count, second.page_count, second.page_tokens, q.size(0), expand);
           const bool decode = required && workspace_ && workspace_size_in_bytes_ >= required;
           float* first_decoded = nullptr;
           float* second_decoded = nullptr;

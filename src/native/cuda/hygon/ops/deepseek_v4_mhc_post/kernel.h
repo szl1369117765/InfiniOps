@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include "base/deepseek_v4_mhc_post.h"
 #include "residual_mix.cuh"
 
@@ -40,7 +41,18 @@ class Operator<DeepseekV4MhcPost,Device::Type::kHygon> : public DeepseekV4MhcPos
     if(!supports(x,r,p,m,y)) throw std::invalid_argument("Invalid DeepSeek V4 mHC post");
     // Reuse inputs across streams for prefill. M<4 retains the original kernel:
     // the extra occupancy is faster for the small decode shape on BW/gfx936.
-    if (r.size(2) == 4096 && r.size(0) >= 4) {
+    const char* pairs = std::getenv("INFINIOPS_DSV4_MHC_POST_PAIRS");
+    const bool pair_aligned = ((reinterpret_cast<uintptr_t>(x.data()) |
+                                reinterpret_cast<uintptr_t>(r.data()) |
+                                reinterpret_cast<uintptr_t>(y.data())) & 3u) == 0;
+    if (r.size(2) == 4096 && r.size(0) >= 1024 && pair_aligned &&
+        pairs && pairs[0] == '1' && pairs[1] == '\0') {
+      const auto blocks = static_cast<unsigned>(std::min<size_t>(r.size(0) * 8, 65535));
+      v4_mhc_post_opt::mix_pairs<<<blocks,256,0,static_cast<cudaStream_t>(stream_)>>>(
+          static_cast<const __nv_bfloat16*>(x.data()),static_cast<const __nv_bfloat16*>(r.data()),
+          static_cast<const float*>(p.data()),static_cast<const float*>(m.data()),
+          static_cast<__nv_bfloat16*>(y.data()),r.size(0));
+    } else if (r.size(2) == 4096 && r.size(0) >= 4) {
       const auto elements = r.size(0) * r.size(2);
       v4_mhc_post_opt::mix_reuse<<<static_cast<unsigned>(std::min<size_t>((elements-1)/256+1,65535)),256,0,
                                  static_cast<cudaStream_t>(stream_)>>>(

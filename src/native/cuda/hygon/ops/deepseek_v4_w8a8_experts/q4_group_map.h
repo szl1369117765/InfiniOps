@@ -18,7 +18,8 @@ struct Q4ExpertGroup {
 template <unsigned TopK>
 __host__ __device__ inline Q4ExpertGroup FindQ4ExpertGroup(const int64_t* ids,
                                                            unsigned slot,
-                                                           size_t experts) {
+                                                           size_t experts,
+                                                           unsigned rows = kGroupTokens) {
   const auto expert = ids[slot];
   Q4ExpertGroup group;
   if (expert < 0 || static_cast<size_t>(expert) >= experts) return group;
@@ -30,7 +31,7 @@ __host__ __device__ inline Q4ExpertGroup FindQ4ExpertGroup(const int64_t* ids,
   }
   group.expert = static_cast<int>(expert);
   group.slots[token] = static_cast<int>(slot);
-  for (unsigned row = 0; row < kGroupTokens; ++row) {
+  for (unsigned row = 0; row < rows; ++row) {
     if (row == token) continue;
     unsigned seen = 0;
     for (unsigned k = 0; k < TopK; ++k) {

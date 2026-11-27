@@ -3,6 +3,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 #include "base/deepseek_v4_c4_index.h"
@@ -358,7 +359,8 @@ class Operator<DeepseekV4C4Index, Device::Type::kHygon> : public DeepseekV4C4Ind
     if (!supports(k,slots,q,w,table,lens,cache,out))
       throw std::invalid_argument("Invalid DeepSeek V4 C4 index geometry");
     bytes_ = workspace_bytes(q, w, table);
-    if (q.size(0) >= v4_c4::kWideScoreMinQueries && q.size(1) == 64) {
+    if (q.size(1) == 64 && (q.size(0) >= v4_c4::kWideScoreMinQueries ||
+                              (q.size(0) >= 2 && q.size(0) <= 16))) {
       cudaDeviceProp properties{};
       wide_score_ = cudaGetDeviceProperties(&properties, q.device().index()) == cudaSuccess &&
                     properties.warpSize == v4_c4::kScoreWave &&
@@ -392,7 +394,10 @@ class Operator<DeepseekV4C4Index, Device::Type::kHygon> : public DeepseekV4C4Ind
       const auto* cache_data = static_cast<const uint8_t*>(cache.data());
       transform<<<grid(query_rows * heads), kWidth, 0, stream>>>(
           static_cast<const __nv_bfloat16*>(q.data()), nullptr, query, scales, query_rows * heads, 0, 0);
-      if (query_rows >= 64 && heads == 64) {
+      const char* tile_mode = std::getenv("INFINIOPS_DSV4_C4_DECODE_TILE");
+      const bool use_decode_tile = wide_score_ && tile_mode && tile_mode[0] == '1' &&
+          tile_mode[1] == '\0' && query_rows >= 2 && query_rows <= 16;
+      if (heads == 64 && (query_rows >= 64 || use_decode_tile)) {
         const auto launch_score = [&](auto width_tag) {
           constexpr unsigned kCandidates = decltype(width_tag)::value;
           constexpr unsigned kTile = kCandidates * (kScoreThreads / kScoreWave);
