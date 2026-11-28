@@ -8,7 +8,8 @@ function(infiniops_add_hygon_flashmla target)
         "${_source}/gfx9/decode/combine/combine.hip"
         "${_source}/gfx9/decode/get_decoding_sched_meta/get_decoding_sched_meta.hip"
         "${_source}/gfx93/decode/sparse_fp8/instantiations/model1_persistent_h64.hip"
-        "${_bridge}/bridge.hip")
+        "${_bridge}/bridge.hip"
+        "${_bridge}/model1_persistent_h16.hip")
     file(GLOB_RECURSE _headers CONFIGURE_DEPENDS "${_source}/*.h" "${_source}/*.hpp" "${_source}/*.cuh")
     set(_objects)
     foreach(_src IN LISTS _hip_sources)

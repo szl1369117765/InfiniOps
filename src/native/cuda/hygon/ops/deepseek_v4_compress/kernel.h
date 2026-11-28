@@ -42,7 +42,7 @@ static __device__ float FastExp(float value) {
   return __builtin_amdgcn_exp2f(value * 1.4426950408889634f);
 }
 
-template<class T>
+template<class T, bool SkipEmpty>
 static __global__ void Pool(const T* projection, const float* ape,
                             const int32_t* sources, const float* state, T* out,
                             size_t input_rows, size_t state_rows, size_t output_rows,
@@ -50,6 +50,15 @@ static __global__ void Pool(const T* projection, const float* ape,
   using Convert = Caster<Device::Type::kHygon>;
   const size_t width = (window == 8 ? 4 : 2) * head_dim;
   for (size_t row = blockIdx.x; row < output_rows; row += gridDim.x) {
+    if constexpr (SkipEmpty) {
+      const bool slot_live = threadIdx.x < window && sources[row * window + threadIdx.x] != -1;
+      if (!__syncthreads_or(slot_live)) {
+        for (size_t channel = threadIdx.x; channel < head_dim; channel += blockDim.x) {
+          out[row * head_dim + channel] = Convert::template Cast<T>(0.0f);
+        }
+        continue;
+      }
+    }
     for (size_t channel = threadIdx.x; channel < head_dim; channel += blockDim.x) {
       const auto load = [&](size_t pos, float& value, float& score) {
         ReadSource(projection, state, ape, sources[row * window + pos], input_rows,
@@ -270,11 +279,19 @@ class Operator<DeepseekV4Compress, Device::Type::kHygon> : public DeepseekV4Comp
           const char* exact = std::getenv("INFINIOPS_DSV4_C4_EXACT_EXP");
           const std::string_view mode = exact ? exact : "";
           const bool exact_exp = mode == "1" || (mode == "decode" && projection.size(0) == 1);
-          Pool<T><<<grid(out.size(0)), 128, 0, stream>>>(
-              data, static_cast<const float*>(ape.data()),
-              static_cast<const int32_t*>(sources.data()), state_data,
-              static_cast<T*>(out.data()), projection.size(0), state.size(0),
-              out.size(0), out.size(1), sources.size(1), ape.size(0) == 4, exact_exp);
+          const auto* skip = std::getenv("INFINIOPS_DSV4_COMPRESS_SKIP_EMPTY");
+          const auto launch_pool = [&](auto fast) {
+            Pool<T, decltype(fast)::value><<<grid(out.size(0)), 128, 0, stream>>>(
+                data, static_cast<const float*>(ape.data()),
+                static_cast<const int32_t*>(sources.data()), state_data,
+                static_cast<T*>(out.data()), projection.size(0), state.size(0),
+                out.size(0), out.size(1), sources.size(1), ape.size(0) == 4, exact_exp);
+          };
+          if (projection.size(0) <= 16 && skip && std::string_view(skip) == "1") {
+            launch_pool(std::true_type{});
+          } else {
+            launch_pool(std::false_type{});
+          }
         }
         if (cudaGetLastError() != cudaSuccess)
           throw std::runtime_error("DeepSeek V4 pooling launch failed");

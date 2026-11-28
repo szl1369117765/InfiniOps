@@ -31,19 +31,23 @@ static __device__ __forceinline__ unsigned prefill_bf16_bits(float value) {
 
 // Lanes 0..3 produce pre, 4..7 post, and 8..23 the 4x4 matrix. Every matrix
 // element follows the scalar reference's exact FP32 operation/reduction order.
-template<bool Split, bool Vectorized = false>
+template<bool Split, bool Vectorized = false, unsigned SplitParts=32>
 static __global__ void mix_parallel(const __nv_bfloat16* residual,const float* values,
     const float* scales,const float* bias,__nv_bfloat16* collapsed,float* post,
     float* combination,size_t rows,size_t hidden,float eps,int64_t iterations,
-    const float* squares,float norm_eps) {
+    const float* squares,float norm_eps,bool wide_prefill_reference = false) {
   __shared__ float pre[4];
   const unsigned tid=threadIdx.x;
   for(size_t row=blockIdx.x;row<rows;row+=gridDim.x) {
     float value=0.0f;
     if(tid<24) {
       if constexpr(Split) {
-        const float inverse=rsqrtf(ordered_splits(squares+row,rows)/float(4*hidden)+norm_eps);
-        value=ordered_splits(values+row*24+tid,rows*24)*inverse;
+        const auto accumulate = [](const float* x, size_t stride) {
+          if constexpr (SplitParts==2) return x[0]+x[stride];
+          else return ordered_splits(x,stride);
+        };
+        const float inverse=rsqrtf(accumulate(squares+row,rows)/float(4*hidden)+norm_eps);
+        value=accumulate(values+row*24+tid,rows*24)*inverse;
       } else value=values[row*24+tid];
     }
     if(tid<4)pre[tid]=logistic<Split>(value*scales[0]+bias[tid])+eps;
@@ -85,19 +89,42 @@ static __global__ void mix_parallel(const __nv_bfloat16* residual,const float* v
     }
     __syncthreads();
     if constexpr (Vectorized) {
-      static_assert(!Split);
       for (size_t col = size_t(tid) * 2; col < hidden; col += blockDim.x * 2) {
-        float lo = 0.0f, hi = 0.0f;
+        if constexpr (Split) {
+          using Pair = float __attribute__((ext_vector_type(2)));
+          const auto load = [&](unsigned h) {
+            const auto* here = residual + (row * 4 + h) * hidden + col;
+            const auto bits = *reinterpret_cast<const unsigned*>(here);
+            return Pair{__uint_as_float(bits << 16), __uint_as_float(bits & 0xffff0000u)};
+          };
+          const auto weighted = [&](Pair a, float scale, Pair b) {
+#if defined(__gfx936__)
+            Pair value;
+            const Pair factors{scale,scale};
+            asm("v_pk_fma_f32 %0, %1, %2, %3" : "=v"(value) : "v"(a), "v"(factors), "v"(b));
+            return value;
+#else
+            return Pair{fmaf(a[0],scale,b[0]),fmaf(a[1],scale,b[1])};
+#endif
+          };
+          const auto result = weighted(load(0),pre[0],load(1)*pre[1]) +
+                              weighted(load(2),pre[2],load(3)*pre[3]);
+          const auto lo=unsigned(__bfloat16_as_ushort(__float2bfloat16_rz(result[0])));
+          const auto hi=unsigned(__bfloat16_as_ushort(__float2bfloat16_rz(result[1])));
+          *reinterpret_cast<unsigned*>(collapsed + row * hidden + col) = lo | (hi << 16);
+        } else {
+          float lo = 0.0f, hi = 0.0f;
 #pragma unroll
-        for (unsigned h = 0; h < 4; ++h) {
-          const auto* here = residual + (row * 4 + h) * hidden + col;
-          const auto pair = *reinterpret_cast<const unsigned*>(here);
-          lo += __uint_as_float(pair << 16) * pre[h];
-          hi += __uint_as_float(pair & 0xffff0000u) * pre[h];
+          for (unsigned h = 0; h < 4; ++h) {
+            const auto* here = residual + (row * 4 + h) * hidden + col;
+            const auto pair = *reinterpret_cast<const unsigned*>(here);
+            lo += __uint_as_float(pair << 16) * pre[h];
+            hi += __uint_as_float(pair & 0xffff0000u) * pre[h];
+          }
+          const auto l = prefill_bf16_bits(lo);
+          const auto h = prefill_bf16_bits(hi);
+          *reinterpret_cast<unsigned*>(collapsed + row * hidden + col) = l | (h << 16);
         }
-        const auto l = prefill_bf16_bits(lo);
-        const auto h = prefill_bf16_bits(hi);
-        *reinterpret_cast<unsigned*>(collapsed + row * hidden + col) = l | (h << 16);
       }
     } else for(size_t col=tid;col<hidden;col+=blockDim.x) {
       if constexpr(Split) {
@@ -105,6 +132,12 @@ static __global__ void mix_parallel(const __nv_bfloat16* residual,const float* v
         const float b=__bfloat162float(residual[(row*4+1)*hidden+col]);
         const float c=__bfloat162float(residual[(row*4+2)*hidden+col]);
         const float d=__bfloat162float(residual[(row*4+3)*hidden+col]);
+        if (wide_prefill_reference && rows > 128 && hidden == 4096) {
+          const float pair = (col & 1) ? fmaf(a,pre[0],b*pre[1]) : fmaf(b,pre[1],a*pre[0]);
+          const float result = fmaf(d,pre[3],fmaf(c,pre[2],pair));
+          collapsed[row*hidden+col]=__float2bfloat16_rz(result);
+          continue;
+        }
         const float left=fmaf(a,pre[0],b*pre[1]);
         const float right=fmaf(c,pre[2],d*pre[3]);
         collapsed[row*hidden+col]=__float2bfloat16_rz(left+right);

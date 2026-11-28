@@ -34,12 +34,22 @@ static __device__ __forceinline__ FloatPair load_pair(const __nv_bfloat16* base)
   return {__uint_as_float(packed << 16), __uint_as_float(packed & 0xffff0000u)};
 }
 
+template<bool PackedFma>
 static __device__ __forceinline__ FloatPair pair_fma(float scale, FloatPair source, FloatPair accum) {
+#if defined(__gfx936__)
+  if constexpr (PackedFma) {
+    const FloatPair factors{scale,scale};
+    FloatPair result;
+    asm("v_pk_fma_f32 %0, %1, %2, %3" : "=v"(result) : "v"(factors), "v"(source), "v"(accum));
+    return result;
+  }
+#endif
   return {fmaf(scale, source[0], accum[0]), fmaf(scale, source[1], accum[1])};
 }
 
 // Each thread reads and writes two adjacent channels without changing
 // either channel's residual-first FMA order or BF16 rounding.
+template<bool PackedFma>
 static __global__ void mix_pairs(const __nv_bfloat16* activation, const __nv_bfloat16* residual,
     const float* post, const float* matrix, __nv_bfloat16* out, size_t rows) {
   constexpr unsigned hidden = 4096, columns = 512, tiles = hidden / columns;
@@ -55,10 +65,10 @@ static __global__ void mix_pairs(const __nv_bfloat16* activation, const __nv_bfl
     for (unsigned stream=0;stream<4;++stream) {
       const float initial = matrix[row*16+stream];
       FloatPair value{initial*r0[0],initial*r0[1]};
-      value=pair_fma(post[row*4+stream],x,value);
-      value=pair_fma(matrix[row*16+4+stream],r1,value);
-      value=pair_fma(matrix[row*16+8+stream],r2,value);
-      value=pair_fma(matrix[row*16+12+stream],r3,value);
+      value=pair_fma<PackedFma>(post[row*4+stream],x,value);
+      value=pair_fma<PackedFma>(matrix[row*16+4+stream],r1,value);
+      value=pair_fma<PackedFma>(matrix[row*16+8+stream],r2,value);
+      value=pair_fma<PackedFma>(matrix[row*16+12+stream],r3,value);
       const auto left=__float2bfloat16_rz(value[0]), right=__float2bfloat16_rz(value[1]);
       const unsigned bits=unsigned(__bfloat16_as_ushort(left))
           | (unsigned(__bfloat16_as_ushort(right)) << 16);

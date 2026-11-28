@@ -20,6 +20,9 @@ static __device__ float decode(uint8_t bits) {
   return (bits & 128) ? -mag : mag;
 }
 
+static __device__ __forceinline__ float decode_e4m3(uint8_t bits);
+
+template <bool ExpandedQuery = false>
 static __global__ void transform(const __nv_bfloat16* in, const int32_t* slots, uint8_t* dst,
                                  float* scales, size_t count, size_t pages, size_t stride) {
   __shared__ float lane_value[kWidth];
@@ -45,7 +48,12 @@ static __global__ void transform(const __nv_bfloat16* in, const int32_t* slots, 
     const float scale = fmaxf(lane_value[0],1.0e-4f) / 448.f;
     auto* page = slots ? dst+(size_t(slot)/kPage)*stride : nullptr;
     auto* bytes = slots ? page+(size_t(slot)%kPage)*kWidth : dst+row*kWidth;
-    bytes[lane] = __nv_cvt_float_to_fp8(value/scale,__NV_SATFINITE,__NV_E4M3);
+    const auto quantized = __nv_cvt_float_to_fp8(value/scale,__NV_SATFINITE,__NV_E4M3);
+    if constexpr (ExpandedQuery) {
+      reinterpret_cast<__nv_bfloat16*>(dst)[row*kWidth+lane] = __float2bfloat16(decode_e4m3(quantized));
+    } else {
+      bytes[lane] = quantized;
+    }
     if (lane == 0) {
       if (slots) reinterpret_cast<float*>(page+kPage*kWidth)[size_t(slot)%kPage] = scale;
       else scales[row] = scale;
@@ -212,6 +220,189 @@ static __global__ void score_tiled(
   }
 }
 
+template <unsigned CandidatesPerWave, bool ExpandedQuery = false,
+          unsigned ScoreThreads = kScoreThreads, bool SharedKeys = false, bool StageWeights = false>
+static __global__ __launch_bounds__(ScoreThreads) void score_grouped_heads(
+    const uint8_t* query, const float* qs, const __nv_bfloat16* weights,
+    const int32_t* table, const int32_t* lengths, const uint8_t* cache,
+    float* scores, size_t rows, size_t heads, size_t width,
+    size_t cache_pages, size_t stride, size_t first_query) {
+  constexpr unsigned groups = ScoreThreads / kScoreWave;
+  constexpr unsigned expected_heads = 64;
+  constexpr unsigned heads_per_group = expected_heads / groups;
+  static_assert(kPage % CandidatesPerWave == 0);
+  const unsigned lane = threadIdx.x % kScoreWave;
+  const unsigned group = threadIdx.x / kScoreWave;
+  const size_t span = width * kPage;
+  const size_t tiles = span / CandidatesPerWave;
+  const size_t jobs = (rows - first_query) * tiles;
+
+  __shared__ float activation[expected_heads][CandidatesPerWave];
+  __shared__ float head_weights[StageWeights ? expected_heads : 1];
+  __shared__ float decoded[SharedKeys ? CandidatesPerWave * kWidth : 1];
+  for (size_t job = blockIdx.x; job < jobs; job += gridDim.x) {
+    const size_t query_row = job / tiles;
+    const size_t row = first_query + query_row;
+    const int32_t length = lengths[row];
+    const size_t base = (job % tiles) * CandidatesPerWave;
+    if (length <= int(kTop) || base >= size_t(length)) continue;
+    const unsigned count = min(size_t(CandidatesPerWave), size_t(length) - base);
+    const int32_t page_index = table[row * width + base / kPage];
+    float* const output = scores + query_row * span + base;
+    if (page_index < 0 || size_t(page_index) >= cache_pages) {
+      if (threadIdx.x < count) output[threadIdx.x] = -INFINITY;
+      continue;
+    }
+    const auto* page = cache + size_t(page_index) * stride;
+    const unsigned offset = base % kPage;
+    const auto* keys = page + offset * kWidth;
+    const auto* scales = reinterpret_cast<const float*>(page + kPage * kWidth) + offset;
+    if constexpr (StageWeights) {
+      if (threadIdx.x < expected_heads) {
+        head_weights[threadIdx.x] = __bfloat162float(weights[query_row * heads + threadIdx.x]);
+      }
+    }
+    if constexpr (SharedKeys) {
+      for (unsigned i=threadIdx.x; i<count*kWidth; i+=ScoreThreads) {
+        decoded[i] = decode_e4m3(keys[i]);
+      }
+    }
+    if constexpr (SharedKeys || StageWeights) __syncthreads();
+    float key_lo[CandidatesPerWave], key_hi[CandidatesPerWave], key_scale[CandidatesPerWave];
+#pragma unroll
+    for (unsigned c = 0; c < CandidatesPerWave; ++c) {
+      const unsigned key = c < count ? c : 0;
+      if constexpr (SharedKeys) {
+        key_lo[c] = decoded[key * kWidth + lane];
+        key_hi[c] = decoded[key * kWidth + lane + kScoreWave];
+      } else {
+        key_lo[c] = decode_e4m3(keys[key * kWidth + lane]);
+        key_hi[c] = decode_e4m3(keys[key * kWidth + lane + kScoreWave]);
+      }
+      key_scale[c] = scales[key];
+    }
+
+    for (unsigned h = group * heads_per_group; h < (group + 1) * heads_per_group; ++h) {
+      const size_t head = query_row * heads + h;
+      float q_lo, q_hi;
+      if constexpr (ExpandedQuery) {
+        const auto* q = reinterpret_cast<const __nv_bfloat16*>(query) + head * kWidth;
+        q_lo = __bfloat162float(q[lane]);
+        q_hi = __bfloat162float(q[lane + kScoreWave]);
+      } else {
+        const auto* q = query + head * kWidth;
+        q_lo = decode_e4m3(q[lane]);
+        q_hi = decode_e4m3(q[lane + kScoreWave]);
+      }
+      float dot[CandidatesPerWave];
+#pragma unroll
+      for (unsigned c = 0; c < CandidatesPerWave; ++c)
+        dot[c] = __fadd_rn(__fmul_rn(key_lo[c], q_lo), __fmul_rn(key_hi[c], q_hi));
+      reduce_score<kScoreWave / 2>(dot);
+      if (lane == 0) {
+        const float query_scale = qs[head];
+#pragma unroll
+        for (unsigned c = 0; c < CandidatesPerWave; ++c) {
+          activation[h][c] =
+              fmaxf(__fmul_rn(__fmul_rn(dot[c], key_scale[c]), query_scale), 0.0f);
+        }
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < count) {
+      const auto c = threadIdx.x;
+      float value = 0.0f;
+      for (unsigned h = 0; h < expected_heads; ++h) {
+        const float weight = StageWeights ? head_weights[h] : __bfloat162float(weights[query_row * heads + h]);
+        value = __fmaf_rn(activation[h][c], weight, value);
+      }
+      output[c] = value;
+    }
+    if (!StageWeights || jobs - job > gridDim.x) __syncthreads();
+  }
+}
+
+using C4Bf16Pack = short __attribute__((ext_vector_type(4)));
+using C4DotPack = float __attribute__((ext_vector_type(4)));
+
+static __device__ __forceinline__ C4Bf16Pack load_c4_pack(const __nv_bfloat16* data) {
+  C4Bf16Pack pack;
+  __builtin_memcpy(&pack, data, sizeof(pack));
+  return pack;
+}
+
+// A block loads one group of 16 candidate keys. Four waves cover all 64
+// query heads, leaving a small ordered reduction across heads for each key.
+static __global__ __launch_bounds__(256) void score_matrix(
+    const __nv_bfloat16* query, const float* qs, const __nv_bfloat16* weights,
+    const int32_t* table, const int32_t* lengths, const uint8_t* cache,
+    float* scores, size_t query_rows, size_t width, size_t cache_pages, size_t stride) {
+#if defined(__gfx936__)
+  constexpr unsigned kHeads = 64;
+  constexpr unsigned kTile = 16;
+  constexpr unsigned kThreads = 256;
+  static_assert(kPage % kTile == 0);
+  const size_t span = width * kPage;
+  const size_t tiles = span / kTile;
+  const unsigned lane = threadIdx.x % 64;
+  const unsigned local_row = lane % kTile;
+  const unsigned lane_group = lane / kTile;
+  const unsigned head = threadIdx.x / 64 * kTile + local_row;
+  __shared__ __nv_bfloat16 decoded[kTile][kWidth];
+  __shared__ float activation[kHeads][kTile];
+  for (size_t job = blockIdx.x; job < query_rows * tiles; job += gridDim.x) {
+    const size_t row = job / tiles;
+    const size_t base = (job % tiles) * kTile;
+    const int32_t length = lengths[row];
+    if (length <= int(kTop) || base >= size_t(length)) continue;
+    const unsigned count = min(size_t(kTile), size_t(length) - base);
+    const int32_t page_index = table[row * width + base / kPage];
+    float* output = scores + row * span + base;
+    if (page_index < 0 || size_t(page_index) >= cache_pages) {
+      if (threadIdx.x < count) output[threadIdx.x] = -INFINITY;
+      continue;
+    }
+    const unsigned offset = base % kPage;
+    const auto* page = cache + size_t(page_index) * stride;
+    const auto* keys = page + offset * kWidth;
+    const auto* scales = reinterpret_cast<const float*>(page + kPage * kWidth) + offset;
+    for (unsigned i = threadIdx.x; i < kTile * kWidth; i += kThreads) {
+      decoded[i / kWidth][i % kWidth] =
+          __float2bfloat16(i / kWidth < count ? decode_e4m3(keys[i]) : 0.0f);
+    }
+    __syncthreads();
+    const auto query_head = row * kHeads + head;
+    const auto* q = query + query_head * kWidth;
+    C4DotPack dots{};
+#pragma unroll
+    for (unsigned k = 0; k < kWidth; k += kTile) {
+      const unsigned element = k + 4 * lane_group;
+      dots = __builtin_hcu_mmac_f32_16x16x16_bf16(
+          load_c4_pack(q + element), load_c4_pack(decoded[local_row] + element), dots);
+    }
+#pragma unroll
+    for (unsigned i = 0; i < 4; ++i) {
+      const unsigned candidate = lane_group + 4 * i;
+      if (candidate < count) {
+        activation[head][candidate] =
+            fmaxf(__fmul_rn(__fmul_rn(dots[i], scales[candidate]), qs[query_head]), 0.0f);
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < count) {
+      const auto candidate = threadIdx.x;
+      float value = 0.0f;
+      for (unsigned h = 0; h < kHeads; ++h) {
+        value = __fmaf_rn(activation[h][candidate],
+                          __bfloat162float(weights[row * kHeads + h]), value);
+      }
+      output[candidate] = value;
+    }
+    if (query_rows * tiles - job > gridDim.x) __syncthreads();
+  }
+#endif
+}
+
 static __global__ void select_serial(float* scores, const int32_t* table, const int32_t* lengths,
                               int32_t* out, size_t rows, size_t width, size_t cache_pages, size_t first_query = 0) {
   const size_t span=width*kPage;
@@ -265,7 +456,7 @@ static __device__ uint64_t sort_key(float value, uint32_t index) {
 
 constexpr unsigned kSelectThreads = 128;
 
-template <unsigned Items>
+template <unsigned Items, bool ScoreBitsOnly = false>
 static __global__ void select_parallel(const float* scores, const int32_t* table,
                                         const int32_t* lengths, int32_t* out,
                                         size_t rows, size_t width, size_t cache_pages,
@@ -289,7 +480,11 @@ static __global__ void select_parallel(const float* scores, const int32_t* table
       const unsigned pos = threadIdx.x * Items + i;
       keys[i] = pos < length ? sort_key(row_scores[pos], pos) : 0;
     }
-    Sort(scratch).SortDescending(keys);
+    // The stable radix pass keeps input position order for ties.
+    if constexpr (ScoreBitsOnly)
+      Sort(scratch).SortDescending(keys, 32, 64);
+    else
+      Sort(scratch).SortDescending(keys);
 #pragma unroll
     for (unsigned i = 0; i < Items; ++i) {
       const unsigned pos = threadIdx.x * Items + i;
@@ -324,9 +519,14 @@ inline bool supports_cache(Tensor key, Tensor slots, Tensor table, Tensor length
 
 inline void write_key_cache(Tensor key, Tensor slots, Tensor cache, cudaStream_t stream) {
   if (!key.size(0)) return;
-  transform<<<grid(key.size(0)), kWidth, 0, stream>>>(
+  transform<false><<<grid(key.size(0)), kWidth, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(key.data()), static_cast<const int32_t*>(slots.data()),
       static_cast<uint8_t*>(cache.data()), nullptr, key.size(0), cache.size(0), cache.size(1));
+}
+
+inline bool decode_head_groups_enabled() {
+  const auto* mode = std::getenv("INFINIOPS_DSV4_C4_DECODE_HEAD_GROUPS");
+  return mode && mode[0] == '1' && mode[1] == '\0';
 }
 
 inline void sequential_indices(Tensor table, Tensor lengths, Tensor cache, Tensor out,
@@ -360,7 +560,7 @@ class Operator<DeepseekV4C4Index, Device::Type::kHygon> : public DeepseekV4C4Ind
       throw std::invalid_argument("Invalid DeepSeek V4 C4 index geometry");
     bytes_ = workspace_bytes(q, w, table);
     if (q.size(1) == 64 && (q.size(0) >= v4_c4::kWideScoreMinQueries ||
-                              (q.size(0) >= 2 && q.size(0) <= 16))) {
+                              q.size(0) <= 16)) {
       cudaDeviceProp properties{};
       wide_score_ = cudaGetDeviceProperties(&properties, q.device().index()) == cudaSuccess &&
                     properties.warpSize == v4_c4::kScoreWave &&
@@ -392,12 +592,58 @@ class Operator<DeepseekV4C4Index, Device::Type::kHygon> : public DeepseekV4C4Ind
       auto* output = static_cast<int32_t*>(out.data());
       const auto* weight_data = static_cast<const __nv_bfloat16*>(w.data());
       const auto* cache_data = static_cast<const uint8_t*>(cache.data());
-      transform<<<grid(query_rows * heads), kWidth, 0, stream>>>(
-          static_cast<const __nv_bfloat16*>(q.data()), nullptr, query, scales, query_rows * heads, 0, 0);
-      const char* tile_mode = std::getenv("INFINIOPS_DSV4_C4_DECODE_TILE");
-      const bool use_decode_tile = wide_score_ && tile_mode && tile_mode[0] == '1' &&
-          tile_mode[1] == '\0' && query_rows >= 2 && query_rows <= 16;
-      if (heads == 64 && (query_rows >= 64 || use_decode_tile)) {
+      const auto enabled = [](const char* name) {
+        const auto* value = std::getenv(name);
+        return value && value[0] == '1' && value[1] == '\0';
+      };
+      const bool grouped = wide_score_ && first_query == 0 && query_rows <= 16 &&
+                           decode_head_groups_enabled();
+      const bool matrix = grouped && enabled("INFINIOPS_DSV4_C4_SCORE_MMAC");
+      const bool expand_query = matrix || (grouped && enabled("INFINIOPS_DSV4_C4_EXPAND_SCORE_Q"));
+      if (expand_query) {
+        transform<true><<<grid(query_rows * heads), kWidth, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data()), nullptr, query, scales,
+            query_rows * heads, 0, 0);
+      } else {
+        transform<false><<<grid(query_rows * heads), kWidth, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data()), nullptr, query, scales,
+            query_rows * heads, 0, 0);
+      }
+      const bool use_decode_tile = wide_score_ && enabled("INFINIOPS_DSV4_C4_DECODE_TILE") &&
+                                   query_rows >= 2 && query_rows <= 16;
+      if (matrix) {
+        constexpr unsigned kMatrixCandidates = 16;
+        score_matrix<<<grid(query_rows * (span / kMatrixCandidates)), 256, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(query), scales, weight_data, pages, lengths,
+            cache_data, scores, query_rows, width, cache.size(0), cache.size(1));
+      } else if (grouped) {
+        constexpr unsigned tile=8;
+        const bool stage_weights = enabled("INFINIOPS_DSV4_C4_STAGE_SCORE_WEIGHTS");
+        const auto launch = [&](auto expanded, auto threads, auto shared_keys) {
+          const auto issue = [&](auto stage_tag) {
+            score_grouped_heads<tile, decltype(expanded)::value, decltype(threads)::value,
+                                decltype(shared_keys)::value, decltype(stage_tag)::value>
+                <<<grid(query_rows * (span / tile)), decltype(threads)::value, 0, stream>>>(
+                    query, scales, weight_data, pages, lengths, cache_data, scores,
+                    rows, heads, width, cache.size(0), cache.size(1), first_query);
+          };
+          if (stage_weights) issue(std::true_type{});
+          else issue(std::false_type{});
+        };
+        const auto select_geometry = [&](auto expanded) {
+          if (enabled("INFINIOPS_DSV4_C4_SHARED_SCORE_KEYS")) {
+            if (span <= 1536) {
+              launch(expanded, std::integral_constant<unsigned, 512>{}, std::true_type{});
+            } else {
+              launch(expanded, std::integral_constant<unsigned, 256>{}, std::true_type{});
+            }
+          } else {
+            launch(expanded, std::integral_constant<unsigned, 256>{}, std::false_type{});
+          }
+        };
+        if (expand_query) select_geometry(std::true_type{});
+        else select_geometry(std::false_type{});
+      } else if (heads == 64 && (query_rows >= 64 || use_decode_tile)) {
         const auto launch_score = [&](auto width_tag) {
           constexpr unsigned kCandidates = decltype(width_tag)::value;
           constexpr unsigned kTile = kCandidates * (kScoreThreads / kScoreWave);
@@ -415,15 +661,30 @@ class Operator<DeepseekV4C4Index, Device::Type::kHygon> : public DeepseekV4C4Ind
             rows, heads, width, cache.size(0), cache.size(1), first_query);
       }
 
+      const auto select = [&](auto num_items, auto high_bits) {
+        select_parallel<decltype(num_items)::value, decltype(high_bits)::value>
+            <<<grid(rows), kSelectThreads, 0, stream>>>(
+                scores, pages, lengths, output, rows, width, cache.size(0), first_query);
+      };
+      const bool use_score_bits = enabled("INFINIOPS_DSV4_C4_SCORE_BITS_TOPK");
+      const auto radix = [&](auto num_items) {
+        if (use_score_bits)
+          select(num_items, std::true_type{});
+        else
+          select(num_items, std::false_type{});
+      };
       if (span <= 1024)
-        select_parallel<8><<<grid(rows), kSelectThreads, 0, stream>>>(
-            scores, pages, lengths, output, rows, width, cache.size(0), first_query);
+        radix(std::integral_constant<unsigned, 8>{});
+      else if (use_score_bits && span <= 1536)
+        select(std::integral_constant<unsigned, 12>{}, std::true_type{});
       else if (span <= 2048)
-        select_parallel<16><<<grid(rows), kSelectThreads, 0, stream>>>(
-            scores, pages, lengths, output, rows, width, cache.size(0), first_query);
+        radix(std::integral_constant<unsigned, 16>{});
+      else if (use_score_bits && span <= 2560)
+        select(std::integral_constant<unsigned, 20>{}, std::true_type{});
+      else if (use_score_bits && span <= 3072)
+        select(std::integral_constant<unsigned, 24>{}, std::true_type{});
       else if (span <= 4096)
-        select_parallel<32><<<grid(rows), kSelectThreads, 0, stream>>>(
-            scores, pages, lengths, output, rows, width, cache.size(0), first_query);
+        radix(std::integral_constant<unsigned, 32>{});
       else
         select_serial<<<grid((rows + 63) / 64), 64, 0, stream>>>(
             scores, pages, lengths, output, rows, width, cache.size(0), first_query);
@@ -434,8 +695,10 @@ class Operator<DeepseekV4C4Index, Device::Type::kHygon> : public DeepseekV4C4Ind
  private:
   static size_t workspace_bytes(Tensor query, Tensor weights, Tensor table) {
     const size_t span = table.size(1) * v4_c4::kPage;
+    const size_t query_bytes = query.size(0) <= 16 && query.size(1) == 64
+        ? query.numel() * sizeof(__nv_bfloat16) : query.numel();
     return span > v4_c4::kTop
-        ? query.numel() + sizeof(float) * (weights.numel() + query.size(0) * span)
+        ? query_bytes + sizeof(float) * (weights.numel() + query.size(0) * span)
         : 0;
   }
 

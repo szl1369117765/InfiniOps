@@ -20,9 +20,16 @@ inline bool use_split_projection(size_t rows, size_t hidden, int64_t iterations)
   return iterations && rows <= 1024 && (hidden == 4096 || hidden == 7168);
 }
 
+inline bool wide_prefill_reference_geometry(size_t rows, size_t hidden, int64_t iterations) {
+  return iterations > 0 && rows >= 8192 && rows <= 65535 && hidden == 4096;
+}
+
 inline size_t workspace_floats(size_t rows, size_t hidden, size_t outputs, int64_t iterations) {
-  return use_split_projection(rows, hidden, iterations) ?
-      rows * kSplits * (outputs + 1) : rows * outputs;
+  if (use_split_projection(rows, hidden, iterations))
+    return rows * kSplits * (outputs + 1);
+  if (wide_prefill_reference_geometry(rows, hidden, iterations))
+    return rows * 2 * (outputs + 1);
+  return rows * outputs;
 }
 
 // Hygon FP32 MMAC assigns the K chunks to four 16-lane groups and writes
@@ -261,6 +268,30 @@ class Operator<DeepseekV4MhcPre,Device::Type::kHygon> : public DeepseekV4MhcPre 
       }
       return;
     }
+    const char* wide_ref = std::getenv("INFINIOPS_DSV4_MHC_WIDE_PREFILL_REFERENCE");
+    if (wide_ref && wide_ref[0] == '1' && wide_ref[1] == '\0' &&
+        wide_prefill_reference_geometry(rows,x.size(2),it)) {
+      constexpr unsigned splits = 2;
+      auto* partial_squares = v + rows * splits * kWidth;
+      const dim3 tiles((rows+15)/16,2,splits);
+      const bool aligned = (reinterpret_cast<uintptr_t>(residual) & 3u) == 0 &&
+                           (reinterpret_cast<uintptr_t>(weight) & 7u) == 0;
+      if (aligned)
+        v4_mhc_opt::project_split<true,true,splits><<<tiles,64,0,stream>>>(
+            residual,weight,v,partial_squares,rows,width);
+      else
+        v4_mhc_opt::project_split<true,false,splits><<<tiles,64,0,stream>>>(
+            residual,weight,v,partial_squares,rows,width);
+      if(cudaGetLastError()!=cudaSuccess)
+        throw std::runtime_error("DeepSeek V4 wide prefill mHC projection launch failed");
+      v4_mhc_opt::mix_parallel<true,false,splits><<<grid(rows),128,0,stream>>>(
+          residual,v,static_cast<const float*>(s.data()),static_cast<const float*>(b.data()),
+          static_cast<__nv_bfloat16*>(y.data()),static_cast<float*>(p.data()),
+          static_cast<float*>(c.data()),rows,x.size(2),float(m),it,partial_squares,float(e),true);
+      if(cudaGetLastError()!=cudaSuccess)
+        throw std::runtime_error("DeepSeek V4 wide prefill mHC mix launch failed");
+      return;
+    }
     if (use_split_projection(rows,x.size(2),it)) {
       squares = v + rows*kSplits*kWidth;
       const dim3 split_grid((rows+15)/16,2,kSplits);
@@ -303,9 +334,18 @@ class Operator<DeepseekV4MhcPre,Device::Type::kHygon> : public DeepseekV4MhcPre 
           static_cast<__nv_bfloat16*>(y.data()),static_cast<float*>(p.data()),
           static_cast<float*>(c.data()),float(m),it,squares,float(e));
     } else if (flash_decoder) {
-      if (squares) v4_mhc_opt::mix_parallel<true><<<grid(rows),128,0,stream>>>(residual,v,static_cast<const float*>(s.data()),
+      const char* exact = std::getenv("INFINIOPS_DSV4_MHC_PREFILL_REFERENCE");
+      const bool wide_prefill_reference = exact && exact[0] == '1' && exact[1] == '\0';
+      const char* split_pairs = std::getenv("INFINIOPS_DSV4_MHC_PRE_SPLIT_PAIRS");
+      if (squares && rows >= 256 && !wide_prefill_reference && split_pairs &&
+          split_pairs[0] == '1' && split_pairs[1] == '\0' &&
+          ((reinterpret_cast<uintptr_t>(residual) | reinterpret_cast<uintptr_t>(y.data())) & 3u) == 0) {
+        v4_mhc_opt::mix_parallel<true,true><<<grid(rows),128,0,stream>>>(residual,v,static_cast<const float*>(s.data()),
           static_cast<const float*>(b.data()),static_cast<__nv_bfloat16*>(y.data()),
           static_cast<float*>(p.data()),static_cast<float*>(c.data()),rows,x.size(2),float(m),it,squares,float(e));
+      } else if (squares) v4_mhc_opt::mix_parallel<true><<<grid(rows),128,0,stream>>>(residual,v,static_cast<const float*>(s.data()),
+          static_cast<const float*>(b.data()),static_cast<__nv_bfloat16*>(y.data()),
+          static_cast<float*>(p.data()),static_cast<float*>(c.data()),rows,x.size(2),float(m),it,squares,float(e),wide_prefill_reference);
       else if (const char* pairs = std::getenv("INFINIOPS_DSV4_MHC_PRE_PAIRS");
                pairs && pairs[0] == '1' && pairs[1] == '\0' && rows >= 1024 &&
                ((reinterpret_cast<uintptr_t>(residual) |

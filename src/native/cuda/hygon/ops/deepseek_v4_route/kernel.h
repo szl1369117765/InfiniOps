@@ -1,6 +1,9 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+#include <type_traits>
+
 #include "base/deepseek_v4_route.h"
 #include "kernel.cuh"
 
@@ -53,13 +56,19 @@ class Operator<DeepseekV4Route, Device::Type::kHygon> : public DeepseekV4Route {
           x.size(0), x.size(1), w.size(1), h ? h->size(0) : 0);
     };
     if (!h && x.size(1) == 256 && w.size(1) == 6) {
-      v4_route::RouteWave64<<<static_cast<unsigned>(std::min<size_t>(
-                                  (x.size(0) - 1) / 4 + 1, 65535)),
-                              256, 0, static_cast<cudaStream_t>(stream_)>>>(
-          static_cast<const float*>(x.data()),
-          b ? static_cast<const float*>(b->data()) : nullptr, float(s),
-          static_cast<float*>(w.data()), static_cast<int64_t*>(i.data()),
-          x.size(0));
+      const auto wave = [&](auto image) {
+        v4_route::RouteWave64<decltype(image)::value>
+            <<<static_cast<unsigned>(std::min<size_t>((x.size(0) - 1) / 4 + 1, 65535)),
+               256, 0, static_cast<cudaStream_t>(stream_)>>>(
+                static_cast<const float*>(x.data()),
+                b ? static_cast<const float*>(b->data()) : nullptr, float(s),
+                static_cast<float*>(w.data()), static_cast<int64_t*>(i.data()), x.size(0));
+      };
+      const char* image = std::getenv("INFINIOPS_DSV4_ROUTE_IMAGE_PROBABILITY");
+      if (image && image[0] == '1' && image[1] == '\0')
+        wave(std::true_type{});
+      else
+        wave(std::false_type{});
     } else if (t && t->dtype() == DataType::kInt32)
       launch(int32_t{});
     else

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 #include "base/i8_gemm.h"
@@ -22,12 +23,14 @@ static __device__ __forceinline__ float ScaleDot(int32_t dot, float activation_s
   return __fmul_rn(static_cast<float>(dot), __fmul_rn(activation_scale, weight_scale));
 }
 
-static __global__ void ScalePrefill(__nv_bfloat16* out, const int32_t* dot,
+template<class T>
+static __global__ void ScalePrefill(T* out, const int32_t* dot,
                                    const float* as, const float* bs, size_t rows, size_t cols) {
   for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < rows * cols;
        i += size_t(gridDim.x) * blockDim.x) {
     const auto scaled = ScaleDot(dot[i], as[i / cols], bs[i % cols]);
-    out[i] = Caster<Device::Type::kHygon>::template Cast<__nv_bfloat16>(scaled);
+    using Convert = Caster<Device::Type::kHygon>;
+    out[i] = Convert::template Cast<T>(Convert::template Cast<__nv_bfloat16>(scaled));
   }
 }
 
@@ -58,7 +61,7 @@ class PrefillHandle {
 };
 
 
-template <class T>
+template <class T, bool RoundBFloat16 = false>
 __global__ void matmul(T* out, const int8_t* a, const float* as,
                        const int8_t* b, const float* bs, const T* bias,
                        size_t m, size_t n, size_t k, ptrdiff_t bias_row,
@@ -85,7 +88,11 @@ __global__ void matmul(T* out, const int8_t* a, const float* as,
       if (bias)
         value += Convert::template Cast<float>(
             bias[row * bias_row + col * bias_col]);
-      out[idx] = Convert::template Cast<T>(value);
+      if constexpr (RoundBFloat16) {
+        out[idx] = Convert::template Cast<T>(Convert::template Cast<__nv_bfloat16>(value));
+      } else {
+        out[idx] = Convert::template Cast<T>(value);
+      }
     }
     __syncthreads();
   }
@@ -206,6 +213,125 @@ static __global__ void matmul_decode_batch(
   }
 }
 
+constexpr unsigned kJoinedQ = 1024, kJoinedKv = 512, kJoinedInput = 4096;
+
+static __device__ __forceinline__ void WriteJoinedQkv(
+    __nv_bfloat16* out, unsigned row, unsigned col, unsigned rows,
+    int32_t dot, float as, float bs, bool scale_first) {
+  const float value = scale_first ? __fmul_rn(__fmul_rn(float(dot), as), bs)
+                                  : ScaleDot(dot, as, bs);
+  const auto index = col < kJoinedQ ? row * kJoinedQ + col
+      : rows * kJoinedQ + row * kJoinedKv + col - kJoinedQ;
+  out[index] = Caster<Device::Type::kHygon>::Cast<__nv_bfloat16>(value);
+}
+
+template<unsigned TileRows>
+static __global__ void JoinedQkvWave(
+    __nv_bfloat16* out, const int8_t* x, const float* as,
+    const int8_t* w, const float* bs, unsigned rows, bool scale_first) {
+  const unsigned first = blockIdx.y * TileRows;
+  const unsigned count = min(rows - first, TileRows);
+  const unsigned lane = threadIdx.x % kWave;
+  const unsigned col = blockIdx.x * kWavesPerBlock + threadIdx.x / kWave;
+  const auto* weight = w + col * kJoinedInput;
+  int32_t dot[TileRows]{};
+  for (unsigned k = lane * 4; k < kJoinedInput; k += kWave * 4) {
+    const auto wk = LoadProjectionInt8x4(weight + k);
+#pragma unroll
+    for (unsigned row = 0; row < TileRows; ++row) {
+      if (row < count) {
+        const auto xk = LoadProjectionInt8x4(x + (first + row) * kJoinedInput + k);
+        dot[row] = ProjectionDot4(xk, wk, dot[row]);
+      }
+    }
+  }
+  for (unsigned offset = kWave / 2; offset; offset /= 2) {
+#pragma unroll
+    for (unsigned row = 0; row < TileRows; ++row)
+      dot[row] += __shfl_down(dot[row], offset, kWave);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (unsigned row = 0; row < TileRows; ++row)
+      if (row < count) WriteJoinedQkv(out, first+row, col, rows, dot[row], as[first+row], bs[col], scale_first);
+  }
+}
+
+// Each wave computes up to 16 decode rows by 16 output channels. Columns
+// 1024–1535 write directly into the contiguous KV range.
+template<unsigned SplitK>
+static __global__ void JoinedQkvMatrix(
+    __nv_bfloat16* out, const int8_t* x, const float* as,
+    const int8_t* w, const float* bs, unsigned rows, bool scale_first) {
+#if defined(__gfx936__)
+  using Int2 = int __attribute__((ext_vector_type(2)));
+  using Int4 = int __attribute__((ext_vector_type(4)));
+  constexpr unsigned tile = 16;
+  const unsigned row = threadIdx.x % tile;
+  const unsigned lane_k = threadIdx.x / tile % 4;
+  const unsigned part = threadIdx.x / kWave;
+  const unsigned first_col = blockIdx.x * tile;
+  constexpr unsigned part_k = kJoinedInput / SplitK;
+  const auto* input = x + (row < rows ? row : 0) * kJoinedInput;
+  const auto* weight = w + (first_col + row) * kJoinedInput;
+  Int4 acc{};
+  const unsigned start_k = part * part_k;
+  for (unsigned k = start_k + lane_k * 8; k < start_k + part_k; k += 32) {
+    const Int2 v = row < rows ? *reinterpret_cast<const Int2*>(input + k) : Int2{};
+    acc = __builtin_hcu_mmac_i32_16x16x32_i8(v, *reinterpret_cast<const Int2*>(weight + k), acc);
+  }
+  if constexpr (SplitK > 1) {
+    __shared__ Int4 sums[SplitK][kWave];
+    const unsigned lane = threadIdx.x % kWave;
+    sums[part][lane] = acc;
+    __syncthreads();
+    if (part) return;
+#pragma unroll
+    for (unsigned i = 1; i < SplitK; ++i) acc += sums[i][lane];
+  }
+  if (row >= rows) return;
+#pragma unroll
+  for (unsigned i = 0; i < 4; ++i) {
+    const unsigned col = first_col + lane_k + 4 * i;
+    WriteJoinedQkv(out, row, col, rows, acc[i], as[row], bs[col], scale_first);
+  }
+#endif
+}
+
+constexpr unsigned kWqBInput = 1024, kWqBOutput = 4096, kWqBChannelsPerWave = 16;
+
+// One wave covers a 16-row tile and 16 output channels, with zeroed inactive
+// rows. Integer dots and the scale-before-dot BF16 epilogue match decode GEMM.
+static __global__ __launch_bounds__(64) void WqBMatrix(
+    __nv_bfloat16* out, const int8_t* x, const float* as,
+    const int8_t* w, const float* bs, unsigned rows) {
+#if defined(__gfx936__)
+  using Int2 = int __attribute__((ext_vector_type(2)));
+  using Int4 = int __attribute__((ext_vector_type(4)));
+  constexpr unsigned tile = kWqBChannelsPerWave;
+  const unsigned row = threadIdx.x % tile;
+  const unsigned lane_k = threadIdx.x / tile;
+  const unsigned first_col = blockIdx.x * tile;
+  const bool active = row < rows;
+  const auto* input = x + (active ? row : 0) * kWqBInput;
+  const auto* weight = w + (first_col + row) * kWqBInput;
+  Int4 acc{};
+#pragma unroll 4
+  for (unsigned k = lane_k * 8; k < kWqBInput; k += 32) {
+    const Int2 v = active ? *reinterpret_cast<const Int2*>(input + k) : Int2{};
+    acc = __builtin_hcu_mmac_i32_16x16x32_i8(
+        v, *reinterpret_cast<const Int2*>(weight + k), acc);
+  }
+  if (!active) return;
+#pragma unroll
+  for (unsigned i = 0; i < 4; ++i) {
+    const unsigned col = first_col + lane_k + 4 * i;
+    out[row * kWqBOutput + col] = Caster<Device::Type::kHygon>::Cast<__nv_bfloat16>(
+        ScaleDot(acc[i], as[row], bs[col]));
+  }
+#endif
+}
+
 static __global__ void matmul_q4_projection(__nv_bfloat16* out, const int8_t* a,
                                             const float* as, const int8_t* b, const float* bs) {
   ProjectionQ4Tile(out, a, as, b, bs);
@@ -224,9 +350,19 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
  public:
   Operator(Tensor c, const Tensor a, const Tensor as, const Tensor b, const Tensor bs,
            const std::optional<Tensor> bias) : I8Gemm(c, a, as, b, bs, bias) {
+    if ((a.ndim() == 2 && c.ndim() == 2 && a.size(0) <= 16 &&
+         a.size(1) == 4096 && c.size(1) == 1536 && c.dtype() == DataType::kBFloat16) ||
+        WqBDecodeShape(c, a, b, bias)) {
+      cudaDeviceProp prop{};
+      gfx936_matrix_ = cudaGetDeviceProperties(&prop, c.device().index()) == cudaSuccess &&
+                           std::strstr(prop.name, "gfx936") != nullptr;
+    }
     if (UsePrefillBlas(c, a, b, bias)) {
       workspace_bytes_ = PrefillWorkspaceBytes(c);
       (void)hygon_i8_gemm::PrefillHandle::Get(c.device().index());
+    }
+    if (WoBFloatShape(c, a, b, bias)) {
+      wo_b_workspace_bytes_ = PrefillWorkspaceBytes(c);
     }
     if (prefill_shape(c, a, bias)) {
       prefill_workspace_bytes_ = c.numel() * sizeof(int32_t);
@@ -234,6 +370,7 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
   }
   bool capture_safe() const override { return true; }
   size_t workspace_size_in_bytes() const override {
+    if (LeadsToFp32Reduction()) return wo_b_workspace_bytes_;
     return prefill_enabled() ? std::max(workspace_bytes_, prefill_workspace_bytes_)
                              : workspace_bytes_;
   }
@@ -263,15 +400,60 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
     if (!supports(c, a, as, b, bs, bias))
       throw std::invalid_argument("Unsupported Hygon INT8 GEMM");
     if (!c.numel()) return;
+    if (const auto* joined = dynamic_cast<const DeepseekV4JoinedQkvConfig*>(config_ptr_.get())) {
+      using namespace hygon_i8_gemm;
+      const unsigned rows = a.size(0);
+      if (!rows || rows > 16 || a.size(1) != kJoinedInput ||
+          c.size(1) != kJoinedQ + kJoinedKv || c.dtype() != DataType::kBFloat16 || bias ||
+          (reinterpret_cast<uintptr_t>(a.data()) | reinterpret_cast<uintptr_t>(b.data())) % 8 != 0)
+        throw std::invalid_argument("Unsupported DeepSeek V4 joined QKV");
+      const auto stream = static_cast<cudaStream_t>(stream_);
+      const auto* x = static_cast<const int8_t*>(a.data());
+      const auto* w = static_cast<const int8_t*>(b.data());
+      auto* out = static_cast<__nv_bfloat16*>(c.data());
+      const auto* xs = static_cast<const float*>(as.data());
+      const auto* ws = static_cast<const float*>(bs.data());
+      constexpr unsigned threads = kWavesPerBlock * kWave;
+      constexpr unsigned blocks = (kJoinedQ + kJoinedKv) / 16;
+      if (gfx936_matrix_ && joined->split_k && rows >= 4 && rows <= 8) {
+        JoinedQkvMatrix<4><<<blocks, 4 * kWave, 0, stream>>>(out, x, xs, w, ws, rows, joined->scale_first);
+      } else if (rows > 8 && gfx936_matrix_) {
+        JoinedQkvMatrix<1><<<blocks, kWave, 0, stream>>>(out, x, xs, w, ws, rows, joined->scale_first);
+      } else if (rows > 1) {
+        const dim3 grid((kJoinedQ + kJoinedKv) / kWavesPerBlock, (rows+3)/4);
+        JoinedQkvWave<4><<<grid, threads, 0, stream>>>(out, x, xs, w, ws, rows, joined->scale_first);
+      } else {
+        constexpr unsigned blocks = (kJoinedQ + kJoinedKv) / kWavesPerBlock;
+        JoinedQkvWave<1><<<blocks, threads, 0, stream>>>(out, x, xs, w, ws, rows, joined->scale_first);
+      }
+      if (cudaGetLastError() != cudaSuccess)
+        throw std::runtime_error("DeepSeek V4 joined QKV launch failed");
+      return;
+    }
     if (c.dtype() == DataType::kBFloat16 && launch_prefill(c, a, as, b, bs, bias)) {
       if (cudaGetLastError() != cudaSuccess)
         throw std::runtime_error("Hygon INT8 prefill launch failed");
       return;
     }
-    if (workspace_bytes_ && UsePrefillBlas(c, a, b, bias)) {
+    if (gfx936_matrix_ && dynamic_cast<const DeepseekV4WqBMatrixConfig*>(config_ptr_.get()) &&
+        WqBDecodeShape(c, a, b, bias)) {
+      using namespace hygon_i8_gemm;
+      WqBMatrix<<<kWqBOutput / kWqBChannelsPerWave, kWave, 0,
+                  static_cast<cudaStream_t>(stream_)>>>(
+          static_cast<__nv_bfloat16*>(c.data()), static_cast<const int8_t*>(a.data()),
+          static_cast<const float*>(as.data()), static_cast<const int8_t*>(b.data()),
+          static_cast<const float*>(bs.data()), a.size(0));
+      if (cudaGetLastError() != cudaSuccess)
+        throw std::runtime_error("DeepSeek V4 WQ_B matrix launch failed");
+      return;
+    }
+    const bool widen_wo_b = LeadsToFp32Reduction();
+    if (widen_wo_b && !WoBFloatShape(c, a, b, bias))
+      throw std::invalid_argument("DeepSeek V4 WO_B has unsupported geometry");
+    if (widen_wo_b || (workspace_bytes_ && UsePrefillBlas(c, a, b, bias))) {
       const auto required_bytes = PrefillWorkspaceBytes(c);
       if (!workspace_ || workspace_size_in_bytes_ < required_bytes ||
-          required_bytes > workspace_bytes_)
+          required_bytes > workspace_size_in_bytes())
         throw std::invalid_argument("Invalid Hygon INT8 prefill workspace");
 
       const auto stream = static_cast<cudaStream_t>(stream_);
@@ -284,35 +466,40 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
       const auto* weight = static_cast<const int8_t*>(b.data());
       const auto* input_scale = static_cast<const float*>(as.data());
       const auto* weight_scale = static_cast<const float*>(bs.data());
-      auto* output = static_cast<__nv_bfloat16*>(c.data());
-      auto* dot = static_cast<int32_t*>(workspace_);
-      const int32_t alpha = 1, beta = 0;
-      for (size_t first_row = 0; first_row < a.size(0);) {
-        const int rows = std::min(kPrefillTileRows, a.size(0) - first_row);
-        const size_t elements = static_cast<size_t>(rows) * n;
-        const auto* tile = input + first_row * k;
-        const auto* tile_scale = input_scale + first_row;
-        auto* tile_output = output + first_row * n;
-        auto status = CUBLAS_STATUS_NOT_SUPPORTED;
-        if (rows >= kPrefillMinRows) {
-          status = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, k,
-              &alpha, weight, CUDA_R_8I, k, tile, CUDA_R_8I, k,
-              &beta, dot, CUDA_R_32I, n, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+      const auto run_tiles = [&](auto tag) {
+        using T = decltype(tag);
+        auto* output = static_cast<T*>(c.data());
+        auto* dot = static_cast<int32_t*>(workspace_);
+        const int32_t alpha = 1, beta = 0;
+        for (size_t first_row = 0; first_row < a.size(0);) {
+          const int rows = std::min(kPrefillTileRows, a.size(0) - first_row);
+          const size_t elements = static_cast<size_t>(rows) * n;
+          const auto* tile = input + first_row * k;
+          const auto* tile_scale = input_scale + first_row;
+          auto* tile_output = output + first_row * n;
+          auto status = CUBLAS_STATUS_NOT_SUPPORTED;
+          if (rows >= kPrefillMinRows) {
+            status = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, k,
+                &alpha, weight, CUDA_R_8I, k, tile, CUDA_R_8I, k,
+                &beta, dot, CUDA_R_32I, n, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+          }
+          if (status == CUBLAS_STATUS_SUCCESS) {
+            hygon_i8_gemm::ScalePrefill<T><<<(elements + 255) / 256, 256, 0, stream>>>(
+                tile_output, dot, tile_scale, weight_scale, rows, n);
+          } else if (status == CUBLAS_STATUS_NOT_SUPPORTED || status == CUBLAS_STATUS_ARCH_MISMATCH) {
+            hygon_i8_gemm::matmul<T, std::is_same_v<T, float>>
+                <<<static_cast<unsigned>(std::min<size_t>(elements, 65535)), 128, 0, stream>>>(
+                    tile_output, tile, tile_scale, weight, weight_scale, nullptr, rows, n, k, 0, 0);
+          } else {
+            throw std::runtime_error("Hygon INT8 GEMM failed: " + std::to_string(int(status)));
+          }
+          if (cudaGetLastError() != cudaSuccess)
+            throw std::runtime_error("Hygon INT8 prefill tile launch failed");
+          first_row += rows;
         }
-        if (status == CUBLAS_STATUS_SUCCESS) {
-          hygon_i8_gemm::ScalePrefill<<<(elements + 255) / 256, 256, 0, stream>>>(
-              tile_output, dot, tile_scale, weight_scale, rows, n);
-        } else if (status == CUBLAS_STATUS_NOT_SUPPORTED || status == CUBLAS_STATUS_ARCH_MISMATCH) {
-          hygon_i8_gemm::matmul<__nv_bfloat16>
-              <<<static_cast<unsigned>(std::min<size_t>(elements, 65535)), 128, 0, stream>>>(
-                  tile_output, tile, tile_scale, weight, weight_scale, nullptr, rows, n, k, 0, 0);
-        } else {
-          throw std::runtime_error("Hygon INT8 GEMM failed: " + std::to_string(int(status)));
-        }
-        if (cudaGetLastError() != cudaSuccess)
-          throw std::runtime_error("Hygon INT8 prefill tile launch failed");
-        first_row += rows;
-      }
+      };
+      if (widen_wo_b) run_tiles(float{});
+      else run_tiles(__nv_bfloat16{});
       return;
     }
     bool used_m12_projection = false;
@@ -467,6 +654,16 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
     }
   }
  private:
+  static bool WqBDecodeShape(const Tensor& c, const Tensor& a, const Tensor& b,
+                            const std::optional<Tensor>& bias) {
+    using namespace hygon_i8_gemm;
+    return a.ndim() == 2 && c.ndim() == 2 && !bias && c.dtype() == DataType::kBFloat16 &&
+           a.size(0) >= 2 && a.size(0) <= 16 && a.size(1) == kWqBInput &&
+           c.size(1) == kWqBOutput &&
+           ((reinterpret_cast<uintptr_t>(a.data()) | reinterpret_cast<uintptr_t>(b.data())) & 7u) == 0;
+  }
+
+  bool gfx936_matrix_{};
   static constexpr int kPrefillMinRows = 64;
   static constexpr size_t kPrefillTileRows = 4096;
 
@@ -484,6 +681,19 @@ class Operator<I8Gemm, Device::Type::kHygon> : public I8Gemm {
     return (k == 4096 && (n == 512 || n == 1024)) || (k == 1024 && (n == 4096 || n == 8192));
   }
 
+  bool LeadsToFp32Reduction() const {
+    return dynamic_cast<const DeepseekV4WoBFloatConfig*>(config_ptr_.get()) != nullptr;
+  }
+
+  static bool WoBFloatShape(const Tensor& c, const Tensor& a, const Tensor& b,
+                            const std::optional<Tensor>& bias) {
+    return a.ndim() == 2 && c.ndim() == 2 && !bias && c.dtype() == DataType::kFloat32 &&
+           a.size(0) >= 1024 && a.size(1) == 1024 && c.size(1) == 4096 &&
+           !(reinterpret_cast<uintptr_t>(a.data()) & 3u) &&
+           !(reinterpret_cast<uintptr_t>(b.data()) & 3u);
+  }
+
+  size_t wo_b_workspace_bytes_{};
   size_t workspace_bytes_{};
 
   static bool prefill_enabled() {

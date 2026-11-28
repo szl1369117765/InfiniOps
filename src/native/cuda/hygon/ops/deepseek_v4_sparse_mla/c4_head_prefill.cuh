@@ -79,15 +79,18 @@ static __device__ __forceinline__ void load_reused_mla_key(
     const Pages& table, const float* decoded, unsigned page_shift, int32_t id,
     unsigned lane, float (&lo)[4], float (&hi)[4]) {
   if constexpr (Predecode) {
-    const auto* key = decoded + static_cast<size_t>(id) * kDim + lane;
+    const auto local = static_cast<size_t>(id) - table.decoded_first_token;
+    if (local < table.decoded_tokens) {
+      const auto* key = decoded + local * kDim + lane;
 #pragma unroll
-    for (unsigned j = 0; j < 4; ++j) {
-      lo[j] = key[j * kThreads];
-      hi[j] = key[j * kThreads + kLongPrefillWaveSize];
+      for (unsigned j = 0; j < 4; ++j) {
+        lo[j] = key[j * kThreads];
+        hi[j] = key[j * kThreads + kLongPrefillWaveSize];
+      }
+      return;
     }
-  } else {
-    load_aligned_mla_key(table, page_shift, id, lane, lo, hi);
   }
+  load_aligned_mla_key(table, page_shift, id, lane, lo, hi);
 }
 
 template <unsigned Step, unsigned Keys, unsigned Heads>

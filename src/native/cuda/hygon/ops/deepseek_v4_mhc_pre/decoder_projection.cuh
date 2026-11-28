@@ -9,15 +9,15 @@ constexpr unsigned Splits=32, Outputs=24, Threads=128;
 
 // Adjacent BF16/FP32 loads preserve the original MMAC4/MMAC8 instruction order.
 // Only the first output tile needs the squared norm; keep that branch outside K.
-template<bool Pack8, bool Squares, bool VectorLoad>
+template<bool Pack8, bool Squares, bool VectorLoad, unsigned SplitParts>
 static __device__ __forceinline__ void split_body(
     const __nv_bfloat16* x,const float* w,float* dots,float* squares,
     size_t rows,size_t width) {
   const unsigned lane=threadIdx.x,group=lane/16;
   const size_t row=blockIdx.x*16+lane%16,col=blockIdx.y*16+lane%16;
-  const size_t start=blockIdx.z*(width/Splits);
+  const size_t start=blockIdx.z*(width/SplitParts);
   Float4 dot={}; float square=0.0f;
-  for(size_t tile=0;tile<width/Splits;tile+=64) {
+  for(size_t tile=0;tile<width/SplitParts;tile+=64) {
     for(unsigned j=0;j<16;j+=2) {
       const size_t k=start+tile+(j/8*4+group)*8+j%8;
       float a0,a1,b0,b1;
@@ -51,11 +51,11 @@ static __device__ __forceinline__ void split_body(
     if(column<Outputs)dots[(blockIdx.z*rows+row)*Outputs+column]=dot[i];
   }
 }
-template<bool Pack8,bool VectorLoad=true>
+template<bool Pack8,bool VectorLoad=true,unsigned SplitParts=32>
 static __global__ void project_split(const __nv_bfloat16* x,const float* w,
                                     float* dots,float* squares,size_t rows,size_t width) {
-  if(blockIdx.y==0)split_body<Pack8,true,VectorLoad>(x,w,dots,squares,rows,width);
-  else split_body<Pack8,false,VectorLoad>(x,w,dots,squares,rows,width);
+  if(blockIdx.y==0)split_body<Pack8,true,VectorLoad,SplitParts>(x,w,dots,squares,rows,width);
+  else split_body<Pack8,false,VectorLoad,SplitParts>(x,w,dots,squares,rows,width);
 }
 
 // Larger prefill fallback: reuse each input load and squared norm across four

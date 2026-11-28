@@ -8,17 +8,18 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace infini::ops::hygon_flash_mla {
 namespace {
-constexpr int kHeads = 64;
 constexpr int kDimension = 512;
 
 void check(hipError_t status) {
   if (status != hipSuccess) throw std::runtime_error(hipGetErrorString(status));
 }
 
+template<int kHeads>
 __global__ void pad_input(const uint16_t* query, const float* sink, uint16_t* padded,
                           float* padded_sink, int rows, int heads) {
   const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -31,6 +32,7 @@ __global__ void pad_input(const uint16_t* query, const float* sink, uint16_t* pa
   if (index < kHeads) padded_sink[index] = index < heads ? sink[index] : 0.0f;
 }
 
+template<int kHeads>
 __global__ void unpad_output(const uint16_t* padded, uint16_t* output, int rows, int heads) {
   const size_t count = static_cast<size_t>(rows) * heads * kDimension;
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
@@ -63,19 +65,49 @@ struct Schedule {
 Schedule schedule_view(const void* storage, int rows, int partitions) {
   static_assert(sizeof(DecodingSchedMeta) == 32 &&
                 alignof(DecodingSchedMeta) == 32);
-  static_assert(31 + sizeof(DecodingSchedMeta) * kMaxSchedulePartitions +
-                    sizeof(int) * (kMaxScheduleRows + 1) <=
-                kScheduleStorageBytes);
   if (!storage || rows <= 0 || rows > kMaxScheduleRows || partitions <= 0 ||
       partitions > kMaxSchedulePartitions)
     throw std::invalid_argument(
         "Unsupported FlashMLA shared schedule geometry");
   const auto address =
       (reinterpret_cast<uintptr_t>(storage) + 31) & ~uintptr_t(31);
+  const auto alignment = address - reinterpret_cast<uintptr_t>(storage);
+  if (alignment + sizeof(DecodingSchedMeta) * partitions + sizeof(int) * (rows+1) >
+      kScheduleStorageBytes)
+    throw std::invalid_argument("FlashMLA shared schedule storage is too small");
   auto* metadata = reinterpret_cast<DecodingSchedMeta*>(address);
   auto* splits =
       reinterpret_cast<int*>(address + sizeof(DecodingSchedMeta) * partitions);
   return {metadata, splits};
+}
+
+__global__ void schedule_independent(const int* swa, const int* extra, int rows, int partitions,
+    int swa_width, int extra_width, int max_blocks, DecodingSchedMeta* metadata, int* prefix) {
+    __shared__ int counts[32];
+    if (threadIdx.x < rows) {
+        const int short_length = swa ? swa[threadIdx.x] : swa_width;
+        const int extra_length = extra ? extra[threadIdx.x] : extra_width;
+        const int short_blocks = (max(short_length, 1)+63)/64;
+        counts[threadIdx.x] = short_blocks + (extra_length+63)/64;
+    }
+    __syncthreads();
+    if (threadIdx.x <= rows) {
+        int count = 0;
+        for (int item=0; item<threadIdx.x; ++item) count += counts[item];
+        prefix[threadIdx.x] = count;
+    }
+    for (int part = threadIdx.x; part < partitions; part += blockDim.x) {
+        const int row = part/max_blocks, block=part%max_blocks;
+        DecodingSchedMeta entry{};
+        if (row < rows && block < counts[row]) {
+            const int split = counts[row]>1;
+            entry = {row,row,block,block+1,block,split,split,{0}};
+        } else {
+            entry.begin_req_idx = rows;
+            entry.end_req_idx = rows-1;
+        }
+        metadata[part] = entry;
+    }
 }
 
 void launch_schedule(int rows, int partitions, int swa_width, int extra_width,
@@ -94,9 +126,45 @@ void launch_schedule(int rows, int partitions, int swa_width, int extra_width,
                                      schedule.splits,
                                      partitions,
                                      stream};
-  gfx9::decode::run_get_decoding_sched_meta_kernel(scheduler);
+  // The split scheduler uses five LDS arrays sized by the query count.
+  // Wide prefill uses the reference's no-split partitioning instead.
+  if (rows > 3072) {
+    gfx9::decode::run_get_decoding_sched_meta_no_split_kernel(scheduler);
+  } else {
+    gfx9::decode::run_get_decoding_sched_meta_kernel(scheduler);
+  }
 }
 
+bool enabled(const char* name) {
+  const auto* value=std::getenv(name);
+  return value && value[0]=='1' && value[1]=='\0';
+}
+
+int independent_blocks(int rows, int partitions, int swa_width, int extra_width) {
+  const bool use_all = enabled("INFINIOPS_DSV4_MLA_ALL_SPLITS");
+  const bool use_c4 = enabled("INFINIOPS_DSV4_MLA_INDEPENDENT_SPLITS") &&
+      rows>1 && extra_width==512;
+  if ((!use_all && !use_c4) || rows<=0 || rows>kMaxScheduleRows || swa_width<=0)
+    return 0;
+  const int max_blocks=(swa_width+63)/64+(extra_width+63)/64;
+  return rows*max_blocks<=partitions && max_blocks+5<=partitions ? max_blocks : 0;
+}
+
+void launch_selected_schedule(int rows, int partitions, int swa_width, int extra_width,
+    const int32_t* swa_lengths, const int32_t* extra_lengths, Schedule schedule, hipStream_t stream) {
+  const auto blocks=independent_blocks(rows,partitions,swa_width,extra_width);
+  if (blocks) {
+    // Preserve the one-block split of the full-partition single-query schedule.
+    hipLaunchKernelGGL(schedule_independent,dim3(1),dim3(128),0,stream,
+        swa_lengths,extra_lengths,rows,rows*blocks,swa_width,extra_width,blocks,
+        schedule.metadata,schedule.splits);
+    check(hipGetLastError());
+  } else {
+    launch_schedule(rows,partitions,swa_width,extra_width,swa_lengths,extra_lengths,schedule,stream);
+  }
+}
+
+template<int kHeads>
 void run_impl(const Arguments& a, const void* prepared_schedule) {
   const auto required = prepared_schedule
                             ? scheduled_workspace_bytes(a.rows, a.partitions)
@@ -118,7 +186,7 @@ void run_impl(const Arguments& a, const void* prepared_schedule) {
                                    work.take<int>(a.rows + 1)};
   const auto stream = static_cast<hipStream_t>(a.stream);
   const unsigned grid = std::min<size_t>((query_count * kDimension + 255) / 256, 65535);
-  pad_input<<<grid,256,0,stream>>>(static_cast<const uint16_t*>(a.query),a.sink,
+  pad_input<kHeads><<<grid,256,0,stream>>>(static_cast<const uint16_t*>(a.query),a.sink,
       reinterpret_cast<uint16_t*>(query),sink,a.rows,a.heads);
   check(hipGetLastError());
 
@@ -165,7 +233,9 @@ void run_impl(const Arguments& a, const void* prepared_schedule) {
   p.stride_extra_indices_b=a.extra.index_width;
   p.stride_extra_indices_s_q=a.extra.index_width;
   p.stream=stream;
-  p.num_sm_parts=a.partitions;
+  const auto independent = independent_blocks(
+      a.rows, a.partitions, a.swa.index_width, a.extra.index_width);
+  p.num_sm_parts=independent ? a.rows * independent : a.partitions;
   p.tile_scheduler_metadata_ptr = schedule.metadata;
   p.num_splits_ptr = schedule.splits;
   p.lse_accum=lse_accum;
@@ -176,9 +246,8 @@ void run_impl(const Arguments& a, const void* prepared_schedule) {
   p.stride_o_accum_s_q=kHeads*kDimension;
   p.stride_o_accum_h_q=kDimension;
   if (!prepared_schedule) {
-    launch_schedule(a.rows, a.partitions, a.swa.index_width,
-                    a.extra.index_width, a.swa.lengths, a.extra.lengths,
-                    schedule, stream);
+    launch_selected_schedule(a.rows, a.partitions, a.swa.index_width,
+        a.extra.index_width, a.swa.lengths, a.extra.lengths, schedule, stream);
   }
   gfx93::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel<ModelType::MODEL1,kHeads>(p);
 
@@ -207,26 +276,33 @@ void run_impl(const Arguments& a, const void* prepared_schedule) {
   combine.attn_sink=sink;
   combine.stream=stream;
   gfx9::decode::run_flash_mla_combine_kernel<cutlass::bfloat16_t>(combine);
-  unpad_output<<<grid,256,0,stream>>>(reinterpret_cast<const uint16_t*>(output),
+  unpad_output<kHeads><<<grid,256,0,stream>>>(reinterpret_cast<const uint16_t*>(output),
       static_cast<uint16_t*>(a.output),a.rows,a.heads);
   check(hipGetLastError());
 }
 }  // namespace
 
-void run(const Arguments& a) { run_impl(a, nullptr); }
+bool use_compact_heads(const Arguments& a) {
+  const auto* value=std::getenv("INFINIOPS_DSV4_FLASHMLA_H16");
+  return a.heads <= 16 && a.rows <= 16 && value && value[0] == '1' && value[1] == '\0';
+}
+
+void run(const Arguments& a) {
+  if (use_compact_heads(a)) run_impl<16>(a, nullptr);
+  else run_impl<64>(a, nullptr);
+}
 
 void prepare_schedule(int rows, int partitions, int swa_width, int extra_width,
                       const int32_t* swa_lengths, const int32_t* extra_lengths,
                       void* schedule, void* stream) {
-  launch_schedule(rows, partitions, swa_width, extra_width, swa_lengths,
-                  extra_lengths, schedule_view(schedule, rows, partitions),
-                  static_cast<hipStream_t>(stream));
+  launch_selected_schedule(rows, partitions, swa_width, extra_width, swa_lengths,
+      extra_lengths, schedule_view(schedule, rows, partitions), static_cast<hipStream_t>(stream));
 }
 
 void run_with_schedule(const Arguments& a, const void* schedule) {
   if (!schedule)
     throw std::invalid_argument("FlashMLA shared schedule is missing");
-  run_impl(a, schedule);
+  if (use_compact_heads(a)) run_impl<16>(a, schedule);
+  else run_impl<64>(a, schedule);
 }
-
-}  // namespace infini::ops::hygon_flash_mla
+} // namespace infini::ops::hygon_flash_mla

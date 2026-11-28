@@ -74,6 +74,69 @@ static __global__ __launch_bounds__(512) void NormHidden(const __nv_bfloat16* in
     output[index] = __float2bfloat16_rn(__fmul_rn(normalized, __bfloat162float(weight[index])));
   }
 }
+// The scalar path maps eight consecutive BF16 values to each logical thread.
+static __device__ __forceinline__ void AccumulatePair(float& sum, unsigned pair) {
+  const float lo = __uint_as_float(pair << 16);
+  const float hi = __uint_as_float(pair & 0xffff0000u);
+  sum = __fmaf_rn(lo, lo, sum);
+  sum = __fmaf_rn(hi, hi, sum);
+}
+
+static __device__ __forceinline__ unsigned NormalizePair(unsigned input, unsigned weight,
+                                                          float inverse_rms) {
+  const float lo = __fmul_rn(__uint_as_float(input << 16), inverse_rms);
+  const float hi = __fmul_rn(__uint_as_float(input & 0xffff0000u), inverse_rms);
+  const auto low = __float2bfloat16_rn(__fmul_rn(lo, __uint_as_float(weight << 16)));
+  const auto high = __float2bfloat16_rn(__fmul_rn(hi, __uint_as_float(weight & 0xffff0000u)));
+  return static_cast<unsigned>(__bfloat16_as_ushort(low)) |
+         (static_cast<unsigned>(__bfloat16_as_ushort(high)) << 16);
+}
+
+template <unsigned Groups>
+static __global__ __launch_bounds__(512 / Groups) void NormAttention(
+    const __nv_bfloat16* input, const __nv_bfloat16* weight, __nv_bfloat16* output,
+    int64_t input_stride, int64_t output_stride, float epsilon) {
+  __shared__ float partial[8];
+  constexpr unsigned threads = 512 / Groups;
+  const unsigned thread = threadIdx.x;
+  const auto* src = reinterpret_cast<const uint4*>(input + blockIdx.x * input_stride);
+  const auto* weights = reinterpret_cast<const uint4*>(weight);
+  auto* dst = reinterpret_cast<uint4*>(output + blockIdx.x * output_stride);
+  uint4 values[Groups];
+#pragma unroll
+  for (unsigned group = 0; group < Groups; ++group) {
+    const unsigned i = thread + group * threads;
+    const uint4 x = src[i];
+    values[group] = x;
+    float sum = 0.0f;
+    AccumulatePair(sum,x.x);
+    AccumulatePair(sum,x.y);
+    AccumulatePair(sum,x.z);
+    AccumulatePair(sum,x.w);
+#pragma unroll
+    for (unsigned offset = 32; offset; offset >>= 1)
+      sum += __shfl_xor_sync(0xffffffff, sum, offset, 64);
+    if (thread % 64 == 0) partial[i / 64] = sum;
+  }
+  __syncthreads();
+  if (thread < 64) {
+    float total = thread < 8 ? partial[thread] : 0.0f;
+#pragma unroll
+    for (unsigned offset = 32; offset; offset >>= 1)
+      total += __shfl_xor_sync(0xffffffff, total, offset, 64);
+    if (thread == 0) partial[0] = rsqrtf(total / 4096.0f + epsilon);
+  }
+  __syncthreads();
+  const float inverse_rms = partial[0];
+#pragma unroll
+  for (unsigned group = 0; group < Groups; ++group) {
+    const unsigned i = thread + group * threads;
+    const uint4 x = values[group];
+    const uint4 w = weights[i];
+    dst[i] = make_uint4(NormalizePair(x.x,w.x,inverse_rms), NormalizePair(x.y,w.y,inverse_rms),
+                        NormalizePair(x.z,w.z,inverse_rms), NormalizePair(x.w,w.w,inverse_rms));
+  }
+}
 }  // namespace hygon_rms_detail
 
 
@@ -109,6 +172,25 @@ class Operator<RmsNorm, Device::Type::kHygon>
         input.dtype() == DataType::kBFloat16 && weight.dtype() == DataType::kBFloat16 &&
         NativeSupports(input, weight, out)) {
       if (!input.size(0)) return;
+      if (input.size(1) == 4096 && input.stride(0) % 8 == 0 && out.stride(0) % 8 == 0 &&
+          (reinterpret_cast<uintptr_t>(input.data()) | reinterpret_cast<uintptr_t>(weight.data()) |
+           reinterpret_cast<uintptr_t>(out.data())) % alignof(uint4) == 0 &&
+          dynamic_cast<const DeepseekV4AttentionRmsNormConfig*>(config_ptr_.get())) {
+        const auto stream = static_cast<cudaStream_t>(stream_);
+        const auto* x = static_cast<const __nv_bfloat16*>(input.data());
+        const auto* w = static_cast<const __nv_bfloat16*>(weight.data());
+        auto* y = static_cast<__nv_bfloat16*>(out.data());
+        if (input.size(0) >= 128) {
+          hygon_rms_detail::NormAttention<2><<<input.size(0),256,0,stream>>>(
+              x,w,y,input.stride(0),out.stride(0),epsilon);
+        } else {
+          hygon_rms_detail::NormAttention<1><<<input.size(0),512,0,stream>>>(
+              x,w,y,input.stride(0),out.stride(0),epsilon);
+        }
+        if (cudaGetLastError() != cudaSuccess)
+          throw std::runtime_error("Hygon DeepSeek V4 attention RMSNorm launch failed");
+        return;
+      }
       hygon_rms_detail::NormHidden<<<input.size(0), input.size(1)/8, 0, static_cast<cudaStream_t>(stream_)>>>(
           static_cast<const __nv_bfloat16*>(input.data()), static_cast<const __nv_bfloat16*>(weight.data()),
           static_cast<__nv_bfloat16*>(out.data()), input.stride(0), out.stride(0), input.size(1), epsilon);

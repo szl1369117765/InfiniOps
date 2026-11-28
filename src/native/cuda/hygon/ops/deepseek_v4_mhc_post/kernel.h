@@ -42,13 +42,16 @@ class Operator<DeepseekV4MhcPost,Device::Type::kHygon> : public DeepseekV4MhcPos
     // Reuse inputs across streams for prefill. M<4 retains the original kernel:
     // the extra occupancy is faster for the small decode shape on BW/gfx936.
     const char* pairs = std::getenv("INFINIOPS_DSV4_MHC_POST_PAIRS");
+    const char* opt = std::getenv("INFINIOPS_DSV4_MHC_POST_PACKED_FMA");
+    const bool packed_fma = opt && opt[0] == '1' && opt[1] == '\0' && r.size(0) >= 256 && r.size(0) < 1024;
     const bool pair_aligned = ((reinterpret_cast<uintptr_t>(x.data()) |
                                 reinterpret_cast<uintptr_t>(r.data()) |
                                 reinterpret_cast<uintptr_t>(y.data())) & 3u) == 0;
-    if (r.size(2) == 4096 && r.size(0) >= 1024 && pair_aligned &&
-        pairs && pairs[0] == '1' && pairs[1] == '\0') {
+    if (r.size(2) == 4096 && pair_aligned &&
+        (packed_fma || (r.size(0) >= 1024 && pairs && pairs[0] == '1' && pairs[1] == '\0'))) {
       const auto blocks = static_cast<unsigned>(std::min<size_t>(r.size(0) * 8, 65535));
-      v4_mhc_post_opt::mix_pairs<<<blocks,256,0,static_cast<cudaStream_t>(stream_)>>>(
+      const auto kernel = packed_fma ? v4_mhc_post_opt::mix_pairs<true> : v4_mhc_post_opt::mix_pairs<false>;
+      kernel<<<blocks,256,0,static_cast<cudaStream_t>(stream_)>>>(
           static_cast<const __nv_bfloat16*>(x.data()),static_cast<const __nv_bfloat16*>(r.data()),
           static_cast<const float*>(p.data()),static_cast<const float*>(m.data()),
           static_cast<__nv_bfloat16*>(y.data()),r.size(0));

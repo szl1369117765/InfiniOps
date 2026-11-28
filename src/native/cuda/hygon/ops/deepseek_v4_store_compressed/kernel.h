@@ -144,7 +144,11 @@ class Operator<DeepseekV4StoreCompressed, Device::Type::kHygon> : public Deepsee
     const auto block_size = RuntimeUtils<Device::Type::kHygon>::GetOptimalBlockSize();
     const char* mode = page_tokens == 64 && pooled.size(0) == 1
         ? std::getenv("INFINIOPS_DSV4_C4_STORE_RMS_REF") : nullptr;
-    const bool reference_rms = mode && mode[0] == '1' && mode[1] == '\0';
+    // The multi-row prefill audit uses the same reduction tree as the reference store.
+    const char* batch_mode = page_tokens == 64 && pooled.size(0) > 1
+        ? std::getenv("INFINIOPS_DSV4_C4_PREFILL_RMS_REF") : nullptr;
+    const bool reference_rms = (mode && mode[0] == '1' && mode[1] == '\0') ||
+                              (batch_mode && batch_mode[0] == '1' && batch_mode[1] == '\0');
     const auto launch = [&](auto position, auto block, auto reference) {
       using Position = decltype(position);
       constexpr unsigned kBlock = decltype(block)::value;

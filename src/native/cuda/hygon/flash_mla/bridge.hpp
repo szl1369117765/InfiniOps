@@ -30,7 +30,7 @@ struct Arguments {
   Pages extra;
 };
 
-inline constexpr int kMaxScheduleRows = 4;
+inline constexpr int kMaxScheduleRows = 8;
 inline constexpr int kMaxSchedulePartitions = 1024;
 inline constexpr size_t kScheduleStorageBytes =
     32 * kMaxSchedulePartitions + 64;

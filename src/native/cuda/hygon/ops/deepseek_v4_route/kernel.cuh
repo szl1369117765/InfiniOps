@@ -7,8 +7,25 @@
 namespace infini::ops {
 namespace v4_route {
 
+// The SGLang DTK image uses the unexpanded softplus below. Keep its threshold
+// and the gfx936 FP32 log reconstruction from the Triton lowering.
+static __device__ float image_probability(float x) {
+  if (x > 20.0f) return __builtin_amdgcn_sqrtf(x);
+  const float z = __builtin_amdgcn_exp2f(__fmul_rn(x, 1.4426950408889634f));
+  const float log2 = __builtin_amdgcn_logf(__fadd_rn(1.0f, z));
+  const float ln2_hi = __uint_as_float(0x3f317217);
+  const float ln2_lo = __uint_as_float(0x3377d1cf);
+  const float product = __fmul_rn(log2, ln2_hi);
+  float correction = fmaf(log2, ln2_hi, -product);
+  correction = fmaf(log2, ln2_lo, correction);
+  const float natural = fmaf(log2, ln2_hi, correction);
+  return __builtin_amdgcn_sqrtf(fabsf(log2) < INFINITY ? natural : log2);
+}
+
 // Reproduce the Triton gate's stable log1p expansion and HCU math.
+template <bool Image = false>
 static __device__ float probability(float x) {
+  if constexpr (Image) return image_probability(x);
   const float exponent =
       __builtin_amdgcn_exp2f(-fabsf(x) * 1.4426950408889634f);
   volatile float shifted = 1.0f + exponent;
@@ -29,7 +46,7 @@ static __device__ float hash_probability(float x) {
   return sqrtf(fmaxf(x, 0.f) + log1pf(expf(-fabsf(x))));
 }
 
-template <class Token>
+template <class Token, bool Image = false>
 __device__ void RouteRow(const float* logits, const float* bias,
                          const Token* tokens, const int64_t* hash, float scale,
                          float* weights, int64_t* ids, size_t rows,
@@ -46,7 +63,7 @@ __device__ void RouteRow(const float* logits, const float* bias,
     } else {
       float best = -INFINITY;
       for (size_t j = 0; j < experts; ++j) {
-        const float rank = probability(x[j]) + (bias ? bias[j] : 0);
+        const float rank = probability<Image>(x[j]) + (bias ? bias[j] : 0);
         if (rank <= best) continue;
         bool used = false;
         for (size_t prev = 0; prev < i; ++prev)
@@ -59,7 +76,7 @@ __device__ void RouteRow(const float* logits, const float* bias,
     }
     const bool valid = id >= 0 && size_t(id) < experts;
     selected[i] = valid ? id : -1;
-    w[i] = valid ? (hash ? hash_probability(x[id]) : probability(x[id])) : 0.f;
+    w[i] = valid ? (hash ? hash_probability(x[id]) : probability<Image>(x[id])) : 0.f;
     norm += w[i];
   }
   if (k == 6) {
@@ -100,6 +117,7 @@ __device__ __forceinline__ void SortPair(uint64_t& a, uint64_t& b) {
   a = hi;
 }
 
+template <bool Image>
 static __global__ void RouteWave64(const float* logits, const float* bias,
                                    float scale, float* weights, int64_t* ids,
                                    size_t rows) {
@@ -114,14 +132,14 @@ static __global__ void RouteWave64(const float* logits, const float* bias,
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const unsigned expert = lane + i * kWave;
-      const float score = probability(logits[row * 256 + expert]) +
+      const float score = probability<Image>(logits[row * 256 + expert]) +
                           (bias ? bias[expert] : 0.0f);
       unusual |= !isfinite(score);
       keys[i] = RouteKey(score, expert);
     }
     if (__any_sync(kMask, unusual)) {
       if (lane == 0) {
-        RouteRow<int64_t>(logits, bias, nullptr, nullptr, scale, weights, ids,
+        RouteRow<int64_t, Image>(logits, bias, nullptr, nullptr, scale, weights, ids,
                           rows, 256, 6, 0, row);
       }
       continue;
@@ -150,7 +168,7 @@ static __global__ void RouteWave64(const float* logits, const float* bias,
       }
     }
     const float value =
-        lane < 6 ? probability(logits[row * 256 + selected]) : 0.0f;
+        lane < 6 ? probability<Image>(logits[row * 256 + selected]) : 0.0f;
     const float w0 = __shfl_sync(kMask, value, 0, kWave);
     const float w1 = __shfl_sync(kMask, value, 1, kWave);
     const float w2 = __shfl_sync(kMask, value, 2, kWave);

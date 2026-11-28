@@ -30,6 +30,7 @@ struct Pages {
   size_t page_stride{};
   size_t page_tokens{};
   size_t index_width{};
+  size_t decoded_first_token{}, decoded_tokens{};
 };
 
 inline int device_partitions(const Tensor& query) {
@@ -303,7 +304,11 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
     parallel_queries_ = v4_sparse_mla_detail::device_partitions(q);
 #ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
     if (q.dtype() == DataType::kBFloat16 && q.size(1) <= 64) {
-      vendor_ = q.size(0) <= v4_sparse_mla_detail::kFlashMlaMaxRows;
+      const auto* mode = std::getenv("INFINIOPS_DSV4_PREFILL_MLA_REFERENCE");
+      const bool reference_prefill = mode && mode[0] == '1' && mode[1] == '\0';
+      constexpr size_t kVerifiedReferenceRows = 8192;
+      vendor_ = q.size(0) <= (reference_prefill ? kVerifiedReferenceRows
+                                               : v4_sparse_mla_detail::kFlashMlaMaxRows);
       if (vendor_) {
         workspace_bytes_ = hygon_flash_mla::workspace_bytes(q.size(0), parallel_queries_);
       } else {
@@ -315,9 +320,11 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
           share_prefill_heads_ = cudaGetDeviceProperties(&properties, q.device().index()) == cudaSuccess &&
                            std::strstr(properties.name, "gfx936") != nullptr;
           if (share_prefill_heads_) {
-            workspace_bytes_ = v4_sparse_mla_detail::decoded_mla_workspace(
-                swa.size(0), extra ? extra->size(0) : 0,
-                extra ? static_cast<size_t>(extra_page_size) : 0, q.size(0), true);
+            query_rows_ = q.size(0);
+            swa_pages_ = swa.size(0);
+            extra_pages_ = extra ? extra->size(0) : 0;
+            extra_tokens_ = extra ? static_cast<size_t>(extra_page_size) : 0;
+            workspace_bytes_ = decoded_workspace(true);
           }
         }
       }
@@ -326,7 +333,12 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
   }
 
   bool capture_safe() const override { return true; }
-  size_t workspace_size_in_bytes() const override { return workspace_bytes_; }
+  size_t workspace_size_in_bytes() const override {
+#ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
+    if (share_prefill_heads_) return decoded_workspace(true);
+#endif
+    return workspace_bytes_;
+  }
 
   void operator()(const Tensor q, const Tensor swa, const Tensor indices,
                   const Tensor lengths, const Tensor sink, const std::optional<Tensor> extra,
@@ -335,8 +347,8 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
     using namespace v4_sparse_mla_detail;
     if (!supports(q, swa, indices, lengths, sink, extra, extra_indices, extra_lengths, extra_page_size, scale, out))
       throw std::invalid_argument("DeepSeek V4 sparse MLA inputs changed");
-    const auto first = pages_for(swa, indices, lengths, 256);
-    const auto second = extra ? pages_for(*extra, *extra_indices, *extra_lengths, extra_page_size) : Pages{};
+    auto first = pages_for(swa, indices, lengths, 256);
+    auto second = extra ? pages_for(*extra, *extra_indices, *extra_lengths, extra_page_size) : Pages{};
 #ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
     if (vendor_) {
       if(!workspace_ || workspace_size_in_bytes_<workspace_bytes_)
@@ -361,20 +373,25 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
           const auto stream = static_cast<cudaStream_t>(stream_);
           const char* expansion = std::getenv("INFINIOPS_DSV4_PREFILL_DECODED_PAGES");
           const bool expand = expansion && expansion[0] == '1' && expansion[1] == '\0';
-          const size_t required = decoded_mla_workspace(
-              first.page_count, second.page_count, second.page_tokens, q.size(0), expand);
+          const size_t required = decoded_workspace(expand);
           const bool decode = required && workspace_ && workspace_size_in_bytes_ >= required;
           float* first_decoded = nullptr;
           float* second_decoded = nullptr;
           if (decode) {
             first_decoded = static_cast<float*>(workspace_);
-            second_decoded = first_decoded + first.page_count * first.page_tokens * kDim;
-            const auto prepare = [&](const Pages& table, float* output) {
-              const size_t tokens = table.page_count * table.page_tokens;
-              DecodeMlaPages<<<static_cast<unsigned>(tokens), 256, 0, stream>>>(table, output);
+            const auto prepare = [&](Pages& table, float* output) {
+              if (!table.data) return;
+              const auto [begin,count] = page_window(table.page_count);
+              table.decoded_first_token = begin * table.page_tokens;
+              table.decoded_tokens = count * table.page_tokens;
+              auto selected = table;
+              selected.data += begin * table.page_stride;
+              selected.page_count = count;
+              DecodeMlaPages<<<static_cast<unsigned>(table.decoded_tokens), 256, 0, stream>>>(selected, output);
             };
             prepare(first, first_decoded);
-            if (second.data) prepare(second, second_decoded);
+            second_decoded = first_decoded + first.decoded_tokens * kDim;
+            prepare(second, second_decoded);
           }
           const size_t groups = blocks / kSharedMlaHeadsPerWave;
           const size_t grid = (groups + kSharedMlaWavesPerBlock - 1) / kSharedMlaWavesPerBlock;
@@ -422,6 +439,19 @@ class Operator<DeepseekV4SparseMla, Device::Type::kHygon>
 #ifdef INFINIOPS_HAVE_HYGON_FLASHMLA
   bool long_prefill_{};
   bool share_prefill_heads_{};
+  size_t query_rows_{}, swa_pages_{}, extra_pages_{}, extra_tokens_{};
+
+  std::pair<size_t,size_t> page_window(size_t pages) const {
+    const auto* window = dynamic_cast<const DeepseekV4PrefillPageWindowConfig*>(config_ptr_.get());
+    if (!window || window->first >= pages || !window->count) return {0,pages};
+    return {window->first, std::min(window->count, pages - window->first)};
+  }
+
+  size_t decoded_workspace(bool expand) const {
+    return v4_sparse_mla_detail::decoded_mla_workspace(
+        page_window(swa_pages_).second, page_window(extra_pages_).second,
+        extra_tokens_, query_rows_, expand);
+  }
 #endif
   size_t workspace_bytes_{};
 };

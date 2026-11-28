@@ -9,6 +9,13 @@
 
 namespace infini::ops {
 
+class DeepseekV4AttentionRmsNormConfig final : public Config {
+ public:
+  std::unique_ptr<Config> Clone() const override {
+    return std::make_unique<DeepseekV4AttentionRmsNormConfig>(*this);
+  }
+};
+
 class RmsNorm : public Operator<RmsNorm> {
  public:
   static bool Valid(const Tensor input, const Tensor weight, const Tensor out) {
@@ -82,6 +89,17 @@ class RmsNorm : public Operator<RmsNorm> {
   Tensor::Size batch_size_{0};
 
   Tensor::Size nhead_{1};
+};
+
+template <>
+struct CacheKeyBuilder<RmsNorm> {
+  template <typename... Args>
+  detail::CacheKey operator()(const Config& config, const Args&... args) const {
+    if (dynamic_cast<const DeepseekV4AttentionRmsNormConfig*>(&config)) {
+      return detail::CacheKey::Build(config.implementation_index(), true, args...);
+    }
+    return detail::CacheKey::Build(config.implementation_index(), args...);
+  }
 };
 
 }  // namespace infini::ops

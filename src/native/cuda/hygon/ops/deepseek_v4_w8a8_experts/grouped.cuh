@@ -241,6 +241,95 @@ static __global__ void GateQuant(
   }
 }
 
+// Adjacent row tiles for one expert can consume the same gate and up weights.
+template <bool Routed>
+static __global__ __launch_bounds__(512) void GateQuantTwo(
+    const int8_t* x, const float* input_scale, const int8_t* weights,
+    const float* scales, int8_t* q_activated, float* activation_scale,
+    Plan plan, unsigned top_k, unsigned hidden, unsigned inner, float limit) {
+  if (blockIdx.x >= *plan.tile_count) return;
+  const auto tile = plan.tiles[blockIdx.x];
+  const auto expert_end = plan.cursors[tile.expert];
+  const auto expert_start = expert_end - plan.counts[tile.expert];
+  if (((tile.start - expert_start) / kM) % 2 != 0) return;
+  constexpr unsigned waves = 8;
+  constexpr unsigned wave_width = waves * kN;
+  constexpr unsigned slices = 256 / wave_width;
+  const unsigned lane_row = threadIdx.x % kM;
+  const unsigned lane_k = threadIdx.x / kM % 4;
+  const unsigned wave = threadIdx.x / 64;
+  const bool valid[2] = {lane_row < tile.count, tile.start + kM + lane_row < expert_end};
+  uint32_t route[2];
+  const int8_t* input[2];
+#pragma unroll
+  for (unsigned row_tile = 0; row_tile < 2; ++row_tile) {
+    route[row_tile] = valid[row_tile] ? plan.routes[tile.start + row_tile * kM + lane_row] : 0;
+    input[row_tile] = x + size_t(route[row_tile] / top_k) * hidden;
+  }
+  const auto gate_row = size_t(tile.expert) * 2 * inner + wave * kN;
+  const auto* gate = weights + (gate_row + lane_row) * hidden;
+  const auto* up = gate + size_t(inner) * hidden;
+  Int4 g[2][slices]{}, u[2][slices]{};
+  for (unsigned k = 0; k < hidden; k += kK) {
+    const unsigned offset = k + lane_k * 8;
+    const Int2 a = valid[0] ? load8(input[0], offset) : Int2{};
+    const Int2 b = valid[1] ? load8(input[1], offset) : Int2{};
+#pragma unroll
+    for (unsigned t = 0; t < slices; ++t) {
+      const auto step = size_t(t) * wave_width * hidden;
+      const Int2 gate_weight = load8(gate + step, offset);
+      const Int2 up_weight = load8(up + step, offset);
+      g[0][t] = mmac(a, gate_weight, g[0][t]);
+      u[0][t] = mmac(a, up_weight, u[0][t]);
+      g[1][t] = mmac(b, gate_weight, g[1][t]);
+      u[1][t] = mmac(b, up_weight, u[1][t]);
+    }
+  }
+  float activations[2][slices][4];
+  __shared__ float maxima[2][waves][kM];
+  constexpr uint64_t mask = 0xffffffffffffffffull;
+#pragma unroll
+  for (unsigned row_tile = 0; row_tile < 2; ++row_tile) {
+    float maximum = 0.0f;
+    const float token_scale = input_scale[route[row_tile] / top_k];
+#pragma unroll
+    for (unsigned t = 0; t < slices; ++t) {
+#pragma unroll
+      for (unsigned o = 0; o < 4; ++o) {
+        const unsigned channel = t * wave_width + lane_k + 4 * o;
+        const auto* scale = scales + gate_row + channel;
+        const float value = Activate<Routed>(g[row_tile][t][o], u[row_tile][t][o], token_scale,
+                                            *scale, scale[inner], limit);
+        activations[row_tile][t][o] = value;
+        maximum = fmaxf(maximum, fabsf(value));
+      }
+    }
+    maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 32, 64));
+    maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 16, 64));
+    if (lane_k == 0) maxima[row_tile][wave][lane_row] = maximum;
+  }
+  __syncthreads();
+#pragma unroll
+  for (unsigned row_tile = 0; row_tile < 2; ++row_tile) {
+    if (!valid[row_tile]) continue;
+    float maximum = 1.0e-10f;
+#pragma unroll
+    for (unsigned w = 0; w < waves; ++w)
+      maximum = fmaxf(maximum, maxima[row_tile][w][lane_row]);
+    if (threadIdx.x < kM) activation_scale[route[row_tile]] = maximum / 127.0f;
+    const float inverse = 127.0f / maximum;
+    auto* result = q_activated + size_t(route[row_tile]) * inner + wave * kN;
+#pragma unroll
+    for (unsigned t = 0; t < slices; ++t) {
+#pragma unroll
+      for (unsigned o = 0; o < 4; ++o) {
+        const int value = __float2int_rn(activations[row_tile][t][o] * inverse);
+        result[t * wave_width + lane_k + 4 * o] = static_cast<int8_t>(min(max(value, -127), 127));
+      }
+    }
+  }
+}
+
 template <bool Routed, unsigned Slices = 1, bool Coalesced = false>
 static __global__ void Down(const int8_t* activated, const float* activation_scale,
                             const float* weights, const int8_t* down, const float* scales,
@@ -365,7 +454,12 @@ inline void run(cudaStream_t stream, const __nv_bfloat16* input,
   // Large batches fill the GPU even with four times fewer thread blocks.
   const bool wide = tokens >= 2048;
   if (wide) {
-    if (routed)
+    const char* paired_gate = std::getenv("INFINIOPS_DSV4_EXPERT_PAIRED_GATE");
+    const bool pair = paired_gate && paired_gate[0] == '1' && paired_gate[1] == '\0';
+    if (routed && pair && tokens >= 4096 && hidden == 4096 && inner == 256 && top_k == 6)
+      GateQuantTwo<true><<<tiles,512,0,stream>>>(q_input, input_scale, gate,
+          gate_scales, q_activated, activation_scale, plan, top_k, hidden, inner, limit);
+    else if (routed)
       GateQuant<true><<<tiles,kThreads,0,stream>>>(q_input, input_scale, gate,
           gate_scales, q_activated, activation_scale, plan, top_k, hidden, inner, limit);
     else
